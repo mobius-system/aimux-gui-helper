@@ -12,6 +12,16 @@ Zane Chee) and the patch list below. This repository is the aimux home for that
 crate: it carries the local patches, builds the binary in CI, and documents how
 the artifact is published and consumed.
 
+## Thanks
+
+This helper is the work of the upstream
+[pi-computer-use](https://github.com/injaneity/pi-computer-use) project — the
+root-forest window model, the accessibility outline, the ref/lookId action
+resolution and the input layer all come from there, and none of it would exist
+here without them. Thanks to its authors for building it and releasing it under
+MIT. Everything this repository adds is the patch list below; any shortcoming in
+the binary we ship is ours, not theirs.
+
 ## Layout
 
 ```
