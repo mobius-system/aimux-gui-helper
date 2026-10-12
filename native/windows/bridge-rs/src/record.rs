@@ -176,6 +176,10 @@ fn bgra_to_nv12(
 ) {
     let y_len = (dst_w * dst_h) as usize;
     debug_assert_eq!(dst.len(), nv12_len(dst_w, dst_h));
+    // The chroma plane is written two pixels at a time, so an odd dimension
+    // would run off the end of the buffer. Every caller goes through
+    // even_dimensions() first.
+    debug_assert!(dst_w % 2 == 0 && dst_h % 2 == 0);
 
     let sample = |x: i32, y: i32| -> (i32, i32, i32) {
         let sx = x + src_x;
@@ -232,9 +236,13 @@ fn luma(r: i32, g: i32, b: i32) -> u8 {
 }
 
 /// BT.709 studio-range chroma (U, V).
+///
+/// Both coefficient sets sum to zero on purpose: a grey pixel then lands on
+/// exactly 128, which is what the encoder's neutral chroma is. An off-by-one
+/// set (the classic `-26 -87 +112`) tints every grey by a bit.
 #[inline]
 fn chroma_for(r: i32, g: i32, b: i32) -> (u8, u8) {
-    let u = ((-26 * r - 87 * g + 112 * b) >> 8) + 128;
+    let u = ((-26 * r - 86 * g + 112 * b) >> 8) + 128;
     let v = ((112 * r - 102 * g - 10 * b) >> 8) + 128;
     (clamp_u8(u), clamp_u8(v))
 }
@@ -1264,15 +1272,16 @@ mod unit_tests {
 
     #[test]
     fn nv12_reads_blue_and_red_from_bgra_order() {
-        // One blue pixel then one red pixel: GDI hands us BGRA, so the first
-        // byte of each pixel is the blue channel.
-        let mut src = vec![0u8; 4 * 2];
-        src[0] = 255; // B
-        src[6] = 255; // R
-        let mut dst = vec![0u8; nv12_len(2, 1)];
-        bgra_to_nv12(&src, 2, 1, 0, 0, 2, 1, &mut dst);
-        assert_eq!(dst[0], 41, "blue carries little luma");
-        assert_eq!(dst[1], 63, "red carries more");
+        // Top row: one blue pixel then one red pixel, both with G = 0. GDI
+        // hands us BGRA, so the blue channel is the first byte of a pixel and
+        // the red channel is the third.
+        let mut src = vec![0u8; 4 * 2 * 2];
+        src[0] = 255; // pixel (0, 0), B
+        src[6] = 255; // pixel (1, 0), R
+        let mut dst = vec![0u8; nv12_len(2, 2)];
+        bgra_to_nv12(&src, 2, 2, 0, 0, 2, 2, &mut dst);
+        assert_eq!(dst[0], 31, "blue carries little luma");
+        assert_eq!(dst[1], 62, "red carries more");
     }
 
     #[test]
@@ -1282,11 +1291,13 @@ mod unit_tests {
             pixel[2] = 255; // red everywhere
         }
         let mut dst = vec![0u8; nv12_len(4, 2)];
-        // The 2x2 source sits centred in a 4x2 frame: columns 0 and 3 pad.
-        bgra_to_nv12(&src, 2, 2, 1, 0, 4, 2, &mut dst);
+        // The 2x2 source sits centred in a 4x2 frame, which is what
+        // center_offsets reports for a window that shrank: columns 0 and 3 pad.
+        assert_eq!(center_offsets(2, 2, 4, 2), (-1, 0));
+        bgra_to_nv12(&src, 2, 2, -1, 0, 4, 2, &mut dst);
         assert_eq!(dst[0], 16, "left padding column should be black");
         assert_eq!(dst[3], 16, "right padding column should be black");
-        assert_eq!(dst[1], 63, "the red source column keeps its luma");
+        assert_eq!(dst[1], 62, "the red source column keeps its luma");
     }
 
     #[test]
@@ -1300,8 +1311,12 @@ mod unit_tests {
             }
         }
         let mut dst = vec![0u8; nv12_len(2, 2)];
-        bgra_to_nv12(&src, 4, 2, 2, 0, 2, 2, &mut dst);
-        assert_eq!(dst[0], 41, "the cropped frame lands on the blue half");
+        // A window that grew: the 2x2 destination covers source columns 1..3,
+        // so the last red column and the first blue column survive.
+        assert_eq!(center_offsets(4, 2, 2, 2), (1, 0));
+        bgra_to_nv12(&src, 4, 2, 1, 0, 2, 2, &mut dst);
+        assert_eq!(dst[0], 62, "the left column of the crop is still red");
+        assert_eq!(dst[1], 31, "the right column of the crop is already blue");
     }
 
     #[test]
