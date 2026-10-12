@@ -62,14 +62,20 @@ scripts/publish-helper.sh     upload the binary + update the helper manifest
   `look` would have shown. Video is H.264 and audio is AAC, muxed by the Media
   Foundation sink writer that ships with Windows, so nothing is downloaded and
   no FFmpeg is involved.
+- **`maxDimension` on recordings** (`record.rs`) — a caller can cap the longest
+  side of the video and let the helper fit the window into it (`scaled_size` +
+  a box-filtered `downscale_bgra`), which is how a recording stays small
+  without the caller working out a bitrate. Protocol 5 → 6, because a protocol-5
+  helper would silently ignore the field and hand back a video at the wrong
+  size.
 
 ## Protocol
 
-Protocol version **5**. Envelope:
+Protocol version **6**. Envelope:
 
 ```json
-{"protocolVersion": 5, "id": "m1728000000000", "cmd": "look", "args": {"rootRef": "@w1"}}
-{"protocolVersion": 5, "id": "m1728000000000", "ok": true, "result": {...}}
+{"protocolVersion": 6, "id": "m1728000000000", "cmd": "look", "args": {"rootRef": "@w1"}}
+{"protocolVersion": 6, "id": "m1728000000000", "ok": true, "result": {...}}
 ```
 
 A request whose `protocolVersion` does not match is rejected; clients treat the
@@ -88,14 +94,21 @@ recorded by that `look`.
 
 ### Recording
 
-`recordStart` takes `{rootRef | windowId, fps?, maxDurationMs?, audio?,
-outputPath?}` — `fps` defaults to 10 (max 30), `maxDurationMs` to 60000 (max
-600000), `audio` to `"system"` (`"mic"` and `"none"` are the alternatives) and
-`outputPath` to `%TEMP%\aimux-<recordingId>.mp4`. It resolves the same target
-as `look`, starts a background thread and answers as soon as the first frame is
-encoded: `{recordingId, target, path, width, height, fps, maxDurationMs, audio,
-hasAudio, audioWarning?, startedAtMs}`. A second `recordStart` while one is
-running is an `invalid_request`.
+`recordStart` takes `{rootRef | windowId, fps?, maxDurationMs?, maxDimension?,
+audio?, outputPath?}` — `fps` defaults to 10 (max 30), `maxDurationMs` to 60000
+(max 600000), `audio` to `"system"` (`"mic"` and `"none"` are the alternatives)
+and `outputPath` to `%TEMP%\aimux-<recordingId>.mp4`. It resolves the same
+target as `look`, starts a background thread and answers as soon as the first
+frame is encoded: `{recordingId, target, path, width, height, fps,
+maxDurationMs, maxDimension, audio, hasAudio, audioWarning?, startedAtMs}`. A
+second `recordStart` while one is running is an `invalid_request`.
+
+`maxDimension` caps the longest side of the encoded video (aspect ratio kept,
+`64`–`8192`); the frame size is fixed by the first frame, later frames are
+box-filtered into it, and a window that is smaller than the cap records at its
+own size. `0` (or omitting the field) means no cap. Handy for keeping a file
+small without guessing a bitrate: a 3096x1944 window at `maxDimension: 1280`
+encodes as 1280x802, and the bitrate follows the smaller frame.
 
 `recordStop` takes `{recordingId?, timeoutMs?}`, stops the recording (it also
 stops itself at `maxDurationMs`) and returns `{recordingId, path, bytes,
@@ -136,7 +149,7 @@ it has on disk and re-downloads when it differs, so publishing a new binary is a
 change of the manifest plus the upload:
 
 ```bash
-scripts/publish-helper.sh --exe out/windows-bridge.exe --helper-version 0.5.1-aimux5 ...
+scripts/publish-helper.sh --exe out/windows-bridge.exe --helper-version 0.5.1-aimux6 ...
 ```
 
 The script reads the manifest from the publish destination, updates

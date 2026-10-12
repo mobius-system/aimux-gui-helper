@@ -33,6 +33,10 @@ pub const MAX_FPS: u32 = 30;
 pub const DEFAULT_MAX_DURATION_MS: u64 = 60_000;
 /// Longest recording we honour, so a forgotten stop cannot fill the disk.
 pub const MAX_MAX_DURATION_MS: u64 = 10 * 60_000;
+/// Smallest window cap we honour (below this nothing is readable anyway).
+pub const MIN_MAX_DIMENSION: u32 = 64;
+/// Largest window cap we honour; above this the cap never binds.
+pub const MAX_MAX_DIMENSION: u32 = 8192;
 
 /// MP4 audio track: what, if anything, is mixed in with the video.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,6 +71,21 @@ impl AudioMode {
 
 fn invalid(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(message, ErrorCode::InvalidRequest)
+}
+
+/// Parse the caller's cap on the longest side of the video.
+///
+/// A missing field and `maxDimension: 0` both mean "no cap", so callers can
+/// pass the field unconditionally; anything else is clamped into the range we
+/// are willing to encode.
+fn parse_max_dimension(args: &Value) -> Option<u32> {
+    match args.get("maxDimension").and_then(Value::as_u64) {
+        None | Some(0) => None,
+        Some(value) => Some(value.clamp(
+            MIN_MAX_DIMENSION as u64,
+            MAX_MAX_DIMENSION as u64,
+        ) as u32),
+    }
 }
 
 #[cfg(not(windows))]
@@ -146,6 +165,81 @@ fn nv12_len(width: u32, height: u32) -> usize {
 /// the H.264 encoder require.
 fn even_dimensions(width: u32, height: u32) -> (u32, u32) {
     (width & !1, height & !1)
+}
+
+/// Fit a window into a `max_dimension` box, keeping its aspect ratio.
+///
+/// The answer is even (the encoder needs that), never larger than the source
+/// (enlarging costs bitrate and adds nothing), and never larger than the box on
+/// its longer side. A source that already fits comes back unchanged, so a cap
+/// the caller passes for safety does not touch an ordinary recording.
+fn scaled_size(src_w: u32, src_h: u32, max_dimension: u32) -> (u32, u32) {
+    let longest = src_w.max(src_h);
+    if max_dimension == 0 || longest <= max_dimension {
+        return even_dimensions(src_w, src_h);
+    }
+    let width = (src_w as u64 * max_dimension as u64 / longest as u64) as u32;
+    let height = (src_h as u64 * max_dimension as u64 / longest as u64) as u32;
+    even_dimensions(width.max(2), height.max(2))
+}
+
+/// Box-filter a BGRA frame down to `dst_w` x `dst_h`.
+///
+/// Every destination pixel averages the source pixels it covers, which is exact
+/// when the ratio is an integer and well behaved when it is not. Only shrinking
+/// is supported: callers size the destination with `scaled_size`, which never
+/// returns something larger than the source.
+fn downscale_bgra(src: &[u8], src_w: u32, src_h: u32, dst: &mut [u8], dst_w: u32, dst_h: u32) {
+    debug_assert!(dst_w > 0 && dst_h > 0);
+    debug_assert!(dst_w <= src_w && dst_h <= src_h);
+    debug_assert!(dst.len() >= dst_w as usize * dst_h as usize * 4);
+
+    // GDI hands us B, G, R, A in that order; a short read counts as black.
+    let sample = |x: u32, y: u32| -> (u32, u32, u32, u32) {
+        let offset = ((y as usize * src_w as usize) + x as usize) * 4;
+        if offset + 3 >= src.len() {
+            return (0, 0, 0, 0);
+        }
+        (
+            src[offset] as u32,
+            src[offset + 1] as u32,
+            src[offset + 2] as u32,
+            src[offset + 3] as u32,
+        )
+    };
+
+    for dy in 0..dst_h {
+        let y0 = dy * src_h / dst_h;
+        let y1 = (((dy + 1) * src_h + dst_h - 1) / dst_h)
+            .max(y0 + 1)
+            .min(src_h);
+        for dx in 0..dst_w {
+            let x0 = dx * src_w / dst_w;
+            let x1 = (((dx + 1) * src_w + dst_w - 1) / dst_w)
+                .max(x0 + 1)
+                .min(src_w);
+            let (mut b, mut g, mut r, mut a, mut count) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (sb, sg, sr, sa) = sample(x, y);
+                    b += sb;
+                    g += sg;
+                    r += sr;
+                    a += sa;
+                    count += 1;
+                }
+            }
+            let count = count.max(1);
+            let offset = ((dy as usize * dst_w as usize) + dx as usize) * 4;
+            if offset + 3 >= dst.len() {
+                continue;
+            }
+            dst[offset] = (b / count) as u8;
+            dst[offset + 1] = (g / count) as u8;
+            dst[offset + 2] = (r / count) as u8;
+            dst[offset + 3] = (a / count) as u8;
+        }
+    }
 }
 
 /// Where to start reading the source so the destination frame sits in the
@@ -318,6 +412,8 @@ mod windows_impl {
         max_duration: Duration,
         audio: AudioMode,
         path: PathBuf,
+        /// Longest side of the encoded video, when the caller capped it.
+        max_dimension: Option<u32>,
     }
 
     pub(super) fn start(
@@ -343,6 +439,7 @@ mod windows_impl {
             .map(|value| value.clamp(1_000, MAX_MAX_DURATION_MS))
             .unwrap_or(DEFAULT_MAX_DURATION_MS);
         let audio = AudioMode::parse(args)?;
+        let max_dimension = parse_max_dimension(args);
 
         let mut guard = registry()
             .lock()
@@ -368,6 +465,7 @@ mod windows_impl {
             max_duration: Duration::from_millis(max_duration_ms),
             audio,
             path,
+            max_dimension,
         };
         let stats = Arc::new(RecordStats::default());
         let stop = Arc::new(Mutex::new(false));
@@ -402,6 +500,7 @@ mod windows_impl {
             "height": stats.height.load(Ordering::Relaxed),
             "fps": fps,
             "maxDurationMs": max_duration_ms,
+            "maxDimension": max_dimension,
             "audio": audio.label(),
             "hasAudio": audio != AudioMode::None,
             "audioWarning": stats.audio_warning.lock().ok().and_then(|w| w.clone()),
@@ -600,10 +699,18 @@ mod windows_impl {
         let hwnd = windows::Win32::Foundation::HWND(params.hwnd as *mut _);
 
         let first = crate::capture::capture_bgra(hwnd).map_err(|e| e.message)?;
-        let (frame_w, frame_h) = even_dimensions(first.width, first.height);
+        // A capped recording keeps the encoder's frame size fixed from here on;
+        // later frames are downscaled into it, and a window that changes size
+        // mid-recording is still centred inside it.
+        let (frame_w, frame_h) = match params.max_dimension {
+            Some(limit) => scaled_size(first.width, first.height, limit),
+            None => even_dimensions(first.width, first.height),
+        };
         if frame_w == 0 || frame_h == 0 {
             return Err("the target window has no capturable area".to_owned());
         }
+        // Reused across frames so a capped recording does not allocate per tick.
+        let mut scratch: Vec<u8> = Vec::new();
 
         // Audio is a nice-to-have: a device that refuses to open must not cost
         // the caller the video, so degrade to video-only and say why.
@@ -656,9 +763,44 @@ mod windows_impl {
                 Ok(frame) => {
                     consecutive_failures = 0;
                     let timestamp = started.elapsed().as_nanos() as i64 / 100;
-                    if let Err(message) =
-                        writer.write_video(&frame, frame_w, frame_h, timestamp, params.fps)
-                    {
+                    let (pixels, src_w, src_h) = match params.max_dimension {
+                        Some(limit) => {
+                            let (target_w, target_h) =
+                                scaled_size(frame.width, frame.height, limit);
+                            // A window that collapsed to nothing (or a frame
+                            // that already matches) goes in as captured.
+                            if target_w > 0
+                                && target_h > 0
+                                && (target_w, target_h) != (frame.width, frame.height)
+                            {
+                                let needed = target_w as usize * target_h as usize * 4;
+                                if scratch.len() != needed {
+                                    scratch.resize(needed, 0);
+                                }
+                                downscale_bgra(
+                                    &frame.pixels,
+                                    frame.width,
+                                    frame.height,
+                                    &mut scratch,
+                                    target_w,
+                                    target_h,
+                                );
+                                (&scratch[..], target_w, target_h)
+                            } else {
+                                (&frame.pixels[..], frame.width, frame.height)
+                            }
+                        }
+                        None => (&frame.pixels[..], frame.width, frame.height),
+                    };
+                    if let Err(message) = writer.write_video(
+                        pixels,
+                        src_w,
+                        src_h,
+                        frame_w,
+                        frame_h,
+                        timestamp,
+                        params.fps,
+                    ) {
                         // Encoder trouble is fatal: later frames cannot help.
                         return Err(format!("video encoding failed: {message}"));
                     }
@@ -853,19 +995,27 @@ mod windows_impl {
 
         /// Encode one captured frame. The frame may differ in size from the
         /// stream (the window was resized): it is centred, cropped or padded.
+        /// Encode one frame of BGRA pixels into the (fixed size) video stream.
+        ///
+        /// `src_w`/`src_h` are the size of `pixels`, which may differ from the
+        /// stream's `width`/`height`: a capped recording downscales the frame
+        /// before calling in, and a window resized mid-recording keeps the
+        /// stream size but gets centred inside it.
         fn write_video(
             &mut self,
-            frame: &crate::capture::Frame,
+            pixels: &[u8],
+            src_w: u32,
+            src_h: u32,
             width: u32,
             height: u32,
             timestamp_hns: i64,
             fps: u32,
         ) -> windows::core::Result<()> {
-            let (crop_x, crop_y) = center_offsets(frame.width, frame.height, width, height);
+            let (crop_x, crop_y) = center_offsets(src_w, src_h, width, height);
             bgra_to_nv12(
-                &frame.pixels,
-                frame.width,
-                frame.height,
+                pixels,
+                src_w,
+                src_h,
                 crop_x,
                 crop_y,
                 width,
@@ -1330,6 +1480,99 @@ mod unit_tests {
     fn frames_are_rounded_down_to_even_dimensions() {
         assert_eq!(even_dimensions(1280, 721), (1280, 720));
         assert_eq!(even_dimensions(1, 1), (0, 0));
+    }
+
+    #[test]
+    fn a_cap_keeps_the_aspect_ratio_and_only_shrinks() {
+        // 3096x1944 capped to 1280 lands on 1280x803, which the encoder needs even.
+        assert_eq!(scaled_size(3096, 1944, 1280), (1280, 802));
+        // A source that already fits, and a disabled cap, both come back as-is.
+        assert_eq!(scaled_size(1920, 1080, 4096), (1920, 1080));
+        assert_eq!(scaled_size(1920, 1080, 0), (1920, 1080));
+        // Odd sides are still rounded for the encoder.
+        assert_eq!(scaled_size(1281, 721, 4096), (1280, 720));
+        assert_eq!(scaled_size(65, 65, 64), (64, 64));
+        // A tall window is capped on its longest side too, not on the width.
+        assert_eq!(scaled_size(1000, 4000, 1000), (250, 1000));
+        // A tiny source cannot collapse to zero.
+        assert_eq!(scaled_size(4, 2, 2), (2, 2));
+    }
+
+    #[test]
+    fn a_cap_never_reaches_a_recording_that_already_fits() {
+        for (w, h) in [(1280, 720), (640, 480), (1920, 1080), (3840, 2160)] {
+            assert_eq!(scaled_size(w, h, 4096), even_dimensions(w, h));
+        }
+    }
+
+    #[test]
+    fn downscaling_to_the_same_size_copies_the_pixels() {
+        let mut src = vec![0u8; 2 * 2 * 4];
+        for (index, pixel) in src.chunks_exact_mut(4).enumerate() {
+            pixel[0] = index as u8; // B
+            pixel[1] = 100 + index as u8; // G
+            pixel[2] = 200 - index as u8; // R
+            pixel[3] = 255;
+        }
+        let mut dst = vec![0u8; 2 * 2 * 4];
+        downscale_bgra(&src, 2, 2, &mut dst, 2, 2);
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn downscaling_averages_the_source_pixels_it_covers() {
+        // 4x2: columns 0..2 red, columns 2..4 blue. Halving the width puts one
+        // source colour in each destination column, so the average is exact.
+        let mut src = vec![0u8; 4 * 2 * 4];
+        for (index, pixel) in src.chunks_exact_mut(4).enumerate() {
+            if index % 4 < 2 {
+                pixel[2] = 255;
+            } else {
+                pixel[0] = 255;
+            }
+        }
+        let mut dst = vec![0u8; 2 * 2 * 4];
+        downscale_bgra(&src, 4, 2, &mut dst, 2, 2);
+        for row in dst.chunks_exact(2 * 4) {
+            assert_eq!(&row[0..4], &[0, 0, 255, 0], "left column stays red");
+            assert_eq!(&row[4..8], &[255, 0, 0, 0], "right column stays blue");
+        }
+    }
+
+    #[test]
+    fn downscaling_a_uniform_frame_changes_nothing() {
+        // An 8x8 field shrunk to 3x3 has ragged box edges; a uniform colour is
+        // the case where those edges must not leak black.
+        let src = vec![7u8; 8 * 8 * 4];
+        let mut dst = vec![0u8; 3 * 3 * 4];
+        downscale_bgra(&src, 8, 8, &mut dst, 3, 3);
+        assert!(dst.iter().all(|&byte| byte == 7));
+    }
+
+    #[test]
+    fn a_short_source_buffer_reads_as_black() {
+        // GDI can hand back fewer bytes than the window claims; the missing
+        // pixels must average in as black rather than panic. Only row 0 of this
+        // 4x2 frame is present, so the destination's second row is all black.
+        let src = vec![255u8; 4 * 4];
+        let mut dst = vec![9u8; 2 * 2 * 4];
+        downscale_bgra(&src, 4, 2, &mut dst, 2, 2);
+        assert_eq!(&dst[0..4], &[255, 255, 255, 255], "the present row wins");
+        assert_eq!(&dst[4..8], &[255, 255, 255, 255], "and so does its neighbour");
+        assert_eq!(&dst[8..12], &[0, 0, 0, 0], "the missing row is black");
+        assert_eq!(&dst[12..16], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_window_cap_is_optional_and_clamped() {
+        assert_eq!(parse_max_dimension(&json!({})), None);
+        assert_eq!(parse_max_dimension(&json!({"maxDimension": 0})), None);
+        assert_eq!(parse_max_dimension(&json!({"maxDimension": 1280})), Some(1280));
+        assert_eq!(parse_max_dimension(&json!({"maxDimension": 1})), Some(64));
+        assert_eq!(
+            parse_max_dimension(&json!({"maxDimension": 99999})),
+            Some(8192)
+        );
     }
 
     #[test]
