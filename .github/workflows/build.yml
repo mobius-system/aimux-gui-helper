@@ -1,0 +1,41 @@
+name: Build windows helper
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Informational: the crate's Windows-only tests need a real desktop
+      # session, so a failure here is a signal, not a release gate.
+      - name: Test
+        working-directory: native/windows/bridge-rs
+        continue-on-error: true
+        run: cargo test --locked
+
+      - name: Build release
+        working-directory: native/windows/bridge-rs
+        run: cargo build --release --locked
+
+      - name: Attach to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          exe=native/windows/bridge-rs/target/release/windows-bridge.exe
+          sha256sum "$exe" | tee sha256.txt
+          gh release delete build -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create build "$exe" sha256.txt \
+            -R "$GITHUB_REPOSITORY" \
+            --title "windows-bridge build" \
+            --notes "Protocol 4, aimux patches applied. sha256.txt is the manifest source of truth." \
+            --latest
