@@ -55,14 +55,21 @@ scripts/publish-helper.sh     upload the binary + update the helper manifest
   tests still called `screenshot(...)` with three arguments after upstream added
   `max_dimension`, so `cargo test` did not compile on Windows (a release build
   did, which is why it went unnoticed). They now pass `None`.
+- **Window recording to MP4** (`record.rs`, `capture.rs`, `Cargo.toml`) — the
+  `recordStart` / `recordStop` / `recordStatus` commands described below. The
+  GDI capture in `capture.rs` was split so `look` (PNG) and the recording thread
+  (NV12) share one `gdi_capture_bgra` body: a recording shows exactly what
+  `look` would have shown. Video is H.264 and audio is AAC, muxed by the Media
+  Foundation sink writer that ships with Windows, so nothing is downloaded and
+  no FFmpeg is involved.
 
 ## Protocol
 
-Protocol version **4**. Envelope:
+Protocol version **5**. Envelope:
 
 ```json
-{"protocolVersion": 4, "id": "m1728000000000", "cmd": "look", "args": {"rootRef": "@w1"}}
-{"protocolVersion": 4, "id": "m1728000000000", "ok": true, "result": {...}}
+{"protocolVersion": 5, "id": "m1728000000000", "cmd": "look", "args": {"rootRef": "@w1"}}
+{"protocolVersion": 5, "id": "m1728000000000", "ok": true, "result": {...}}
 ```
 
 A request whose `protocolVersion` does not match is rejected; clients treat the
@@ -70,13 +77,43 @@ mismatch as "helper needs reinstalling" rather than as a bad request.
 
 Commands: `diagnostics`, `listRoots` (alias `listWindows`), `look` (alias
 `screenshot`), `focusWindow`, `act`, `actBatch`, `uiaReadText` (alias
-`axReadText`), `uiaWaitFor` (alias `axWaitFor`), `openBrowserLocation`.
-Unknown commands return `UnsupportedCommand`.
+`axReadText`), `uiaWaitFor` (alias `axWaitFor`), `openBrowserLocation`,
+`recordStart`, `recordStop`, `recordStatus`. Unknown commands return
+`UnsupportedCommand`.
 
 `look` returns a `lookId` that `act` resolves refs and image coordinates
 against; `act` accepts either an element ref from the outline or image
 coordinates, which it inverts back to physical pixels through the scale factor
 recorded by that `look`.
+
+### Recording
+
+`recordStart` takes `{rootRef | windowId, fps?, maxDurationMs?, audio?,
+outputPath?}` — `fps` defaults to 10 (max 30), `maxDurationMs` to 60000 (max
+600000), `audio` to `"system"` (`"mic"` and `"none"` are the alternatives) and
+`outputPath` to `%TEMP%\aimux-<recordingId>.mp4`. It resolves the same target
+as `look`, starts a background thread and answers as soon as the first frame is
+encoded: `{recordingId, target, path, width, height, fps, maxDurationMs, audio,
+hasAudio, audioWarning?, startedAtMs}`. A second `recordStart` while one is
+running is an `invalid_request`.
+
+`recordStop` takes `{recordingId?, timeoutMs?}`, stops the recording (it also
+stops itself at `maxDurationMs`) and returns `{recordingId, path, bytes,
+durationMs, width, height, fps, videoFrames, audioFrames, audio, hasAudio,
+audioWarning?, error?, stopped}`. The MP4 is finalized before it answers, so the
+file is complete when the response arrives.
+
+`recordStatus` takes `{recordingId?}` and reports `{active, recordingId, path,
+elapsedMs, videoFrames, audioFrames, ...}` without stopping anything.
+
+The recording thread captures through the `look` path, so occlusion does not
+matter and the helper stays usable for `look` / `act` while it records. A
+window that is resized mid-recording is centre-cropped or padded with black
+rather than restarting the stream, and a window that disappears ends the
+recording after five seconds without a frame. Audio failures never cost the
+video: the recording continues silently and explains itself in
+`audioWarning`. Everything here is Windows-only — other platforms answer
+`unsupported_platform`.
 
 ## Build
 
@@ -110,14 +147,10 @@ committed here.
 
 ## Roadmap
 
-- **Window recording to MP4.** Add `recordStart` / `recordStop`: a helper-side
-  thread captures the target window at N fps through the existing capture path
-  (so occlusion does not matter) and muxes H.264 with the Windows Media
-  Foundation sink writer — no FFmpeg dependency — writing an `.mp4` on the
-  remote host. Recording has to be start/stop rather than one blocking call so
-  the helper stays usable for `look` / `act` while it records. That bumps the
-  protocol version, so the aimux client's expected version and the manifest's
-  `protocolVersion` move together.
+- **Recording follow-ups.** Per-frame cursor drawing, a quality knob
+  (`videoBitrateKbps`), and mixing system sound with the microphone into one
+  track are the obvious next steps; today a recording takes one audio source at
+  a time.
 - Multi-monitor and per-monitor DPI reporting are already handled at startup
   (per-monitor-v2 awareness); deeper capture backends (Windows Graphics Capture)
   are not planned for now.

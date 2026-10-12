@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use windows_bridge::{
-    capture, input, protocol::PROTOCOL_VERSION, refs::RefStore, window, ErrorCode, ProtocolError,
-    Request, Response,
+    capture, input, protocol::PROTOCOL_VERSION, record, refs::RefStore, window, ErrorCode,
+    ProtocolError, Request, Response,
 };
 
 #[derive(Clone, Debug)]
@@ -221,6 +221,9 @@ fn handle_request(request: &Request) -> Response {
         "uiaReadText" | "axReadText" => handle_read_text(&request.args),
         "uiaWaitFor" | "axWaitFor" => handle_wait_for(&request.args),
         "openBrowserLocation" => handle_open_browser_location(&request.args),
+        "recordStart" => handle_record_start(&request.args),
+        "recordStop" => record::stop(&request.args),
+        "recordStatus" => record::status(&request.args),
         other => Err(ProtocolError::new(
             format!("Unknown command '{other}'"),
             ErrorCode::UnsupportedCommand,
@@ -285,6 +288,61 @@ fn handle_focus_window(args: &Value) -> Result<Value, ProtocolError> {
         .lock()
         .map_err(|_| internal("helper state lock poisoned"))?;
     window::focus_window(&state.store, &wref)
+}
+
+/// Start recording the window named by a root ref or a window id.
+fn handle_record_start(args: &Value) -> Result<Value, ProtocolError> {
+    let wref = resolve_record_target(args)?;
+    // The recording runs on its own thread and only needs the store; holding
+    // the helper state lock for the whole recording would freeze look / act.
+    let store = {
+        let state = helper_state()
+            .lock()
+            .map_err(|_| internal("helper state lock poisoned"))?;
+        state.store.clone()
+    };
+    record::start(&store, &wref, args)
+}
+
+/// Resolve the target of a recording request, mirroring how `look` does it: a
+/// root ref is taken as-is, a window id is mapped through the root list
+/// (discovering windows first when nothing has been listed yet).
+fn resolve_record_target(
+    args: &Value,
+) -> Result<windows_bridge::refs::WindowRef, ProtocolError> {
+    let root_ref = args
+        .get("rootRef")
+        .or_else(|| args.get("windowRef"))
+        .and_then(Value::as_str);
+    let window_id = args.get("windowId").and_then(Value::as_i64);
+    if root_ref.is_none() && window_id.is_none() {
+        return Err(invalid("recordStart requires rootRef or windowId"));
+    }
+
+    let root_ref = match root_ref {
+        Some(root_ref) => root_ref.to_owned(),
+        None => {
+            let roots_missing = helper_state()
+                .lock()
+                .map_err(|_| internal("helper state lock poisoned"))?
+                .roots
+                .is_empty();
+            if roots_missing {
+                let _ = handle_list_roots(&json!({}));
+            }
+            helper_state()
+                .lock()
+                .map_err(|_| internal("helper state lock poisoned"))?
+                .roots
+                .values()
+                .find(|root| root.get("windowId").and_then(Value::as_i64) == window_id)
+                .and_then(|root| root.get("rootRef").and_then(Value::as_str).map(str::to_owned))
+                .ok_or_else(|| ProtocolError::new("Root not found", ErrorCode::TargetNotFound))?
+        }
+    };
+
+    windows_bridge::refs::WindowRef::parse(&root_ref)
+        .ok_or_else(|| invalid(format!("Invalid root ref '{root_ref}'")))
 }
 
 fn handle_look(args: &Value) -> Result<Value, ProtocolError> {

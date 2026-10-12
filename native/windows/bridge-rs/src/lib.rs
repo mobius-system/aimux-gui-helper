@@ -7,6 +7,7 @@ pub mod capture;
 pub mod error;
 pub mod input;
 pub mod protocol;
+pub mod record;
 pub mod refs;
 pub mod state;
 pub mod uia;

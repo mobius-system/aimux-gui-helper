@@ -1,0 +1,1355 @@
+//! Window recording to MP4 with the Windows Media Foundation sink writer.
+//!
+//! Video comes from the same GDI path `look` uses (PrintWindow with
+//! PW_RENDERFULLCONTENT), so occlusion does not matter and no screen-capture
+//! API is involved. Audio comes from WASAPI — the default render endpoint in
+//! loopback mode (system sound) or the default capture endpoint (microphone).
+//! Video is H.264 and audio is AAC, muxed into one MP4 by the sink writer that
+//! ships with Windows; there is no FFmpeg dependency.
+//!
+//! Recording is start/stop rather than one blocking call: `recordStart` returns
+//! as soon as the first frame is encoded and hands the work to a background
+//! thread, so `look` / `act` keep working while the file grows. The recording
+//! stops itself at `maxDurationMs`, and a later `recordStop` still collects the
+//! finished file.
+//!
+//! On non-Windows platforms every entry point returns `unsupported_platform`.
+
+use serde_json::{json, Value};
+
+use crate::error::{ErrorCode, ProtocolError};
+use crate::refs::{RefStore, WindowRef};
+
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(windows)]
+use std::time::Duration;
+
+/// Frames per second when the caller does not ask for a rate.
+pub const DEFAULT_FPS: u32 = 10;
+/// Fastest capture rate we honour.
+pub const MAX_FPS: u32 = 30;
+/// Recording length when the caller does not ask for one.
+pub const DEFAULT_MAX_DURATION_MS: u64 = 60_000;
+/// Longest recording we honour, so a forgotten stop cannot fill the disk.
+pub const MAX_MAX_DURATION_MS: u64 = 10 * 60_000;
+
+/// MP4 audio track: what, if anything, is mixed in with the video.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AudioMode {
+    None,
+    /// What the machine is playing (WASAPI loopback on the render endpoint).
+    System,
+    /// The default recording device (microphone, line in, ...).
+    Mic,
+}
+
+impl AudioMode {
+    fn parse(args: &Value) -> Result<Self, ProtocolError> {
+        match args.get("audio").and_then(Value::as_str) {
+            None | Some("system") => Ok(AudioMode::System),
+            Some("mic") => Ok(AudioMode::Mic),
+            Some("none") => Ok(AudioMode::None),
+            Some(other) => Err(invalid(format!(
+                "audio must be system, mic, or none (got '{other}')"
+            ))),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AudioMode::None => "none",
+            AudioMode::System => "system",
+            AudioMode::Mic => "mic",
+        }
+    }
+}
+
+fn invalid(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(message, ErrorCode::InvalidRequest)
+}
+
+#[cfg(not(windows))]
+fn unsupported() -> ProtocolError {
+    ProtocolError::new(
+        "Window recording is only supported on Windows",
+        ErrorCode::UnsupportedPlatform,
+    )
+}
+
+/// Start recording one window to an MP4 on the host that runs the helper.
+///
+/// Returns once the first frame has been encoded, so an unavailable encoder or
+/// an uncapturable window is reported to the caller instead of failing
+/// silently in the background.
+pub fn start(store: &RefStore, target: &WindowRef, args: &Value) -> Result<Value, ProtocolError> {
+    #[cfg(not(windows))]
+    {
+        let _ = (store, target, args);
+        Err(unsupported())
+    }
+
+    #[cfg(windows)]
+    {
+        windows_impl::start(store, target, args)
+    }
+}
+
+/// Stop the recording and report what landed on disk.
+pub fn stop(args: &Value) -> Result<Value, ProtocolError> {
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        Err(unsupported())
+    }
+
+    #[cfg(windows)]
+    {
+        windows_impl::stop(args)
+    }
+}
+
+/// Report on the active (or last finished) recording without stopping it.
+pub fn status(args: &Value) -> Result<Value, ProtocolError> {
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        Err(unsupported())
+    }
+
+    #[cfg(windows)]
+    {
+        windows_impl::status(args)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+//
+// These carry no Windows types, so they are unit-tested on every platform.
+// ---------------------------------------------------------------------------
+
+/// Roughly 0.1 bits per pixel per frame: enough for readable text in a UI
+/// recording without turning ten seconds into tens of megabytes.
+fn video_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+    let pixels = width as u64 * height as u64;
+    let bitrate = pixels * fps as u64 / 10;
+    bitrate.clamp(500_000, 20_000_000) as u32
+}
+
+/// Bytes in one NV12 frame: a full luma plane plus a half-height chroma plane.
+fn nv12_len(width: u32, height: u32) -> usize {
+    (width as usize * height as usize * 3) / 2
+}
+
+/// Round a captured frame down to the even dimensions an NV12 video stream and
+/// the H.264 encoder require.
+fn even_dimensions(width: u32, height: u32) -> (u32, u32) {
+    (width & !1, height & !1)
+}
+
+/// Where to start reading the source so the destination frame sits in the
+/// middle of it (used both to crop a window that grew and to pad one that
+/// shrank).
+fn center_offsets(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> (i32, i32) {
+    (
+        (src_w as i32 - dst_w as i32) / 2,
+        (src_h as i32 - dst_h as i32) / 2,
+    )
+}
+
+/// Convert top-down BGRA into NV12 (BT.709, studio range).
+///
+/// `src_x`/`src_y` may be negative: the parts of the destination outside the
+/// source are filled with black (luma 16, chroma 128), which is what a window
+/// resized mid-recording needs.
+#[allow(clippy::too_many_arguments)]
+fn bgra_to_nv12(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    src_x: i32,
+    src_y: i32,
+    dst_w: u32,
+    dst_h: u32,
+    dst: &mut [u8],
+) {
+    let y_len = (dst_w * dst_h) as usize;
+    debug_assert_eq!(dst.len(), nv12_len(dst_w, dst_h));
+
+    let sample = |x: i32, y: i32| -> (i32, i32, i32) {
+        let sx = x + src_x;
+        let sy = y + src_y;
+        if sx < 0 || sy < 0 || sx >= src_w as i32 || sy >= src_h as i32 {
+            return (0, 0, 0);
+        }
+        let offset = (sy as usize * src_w as usize + sx as usize) * 4;
+        if offset + 3 >= src.len() {
+            return (0, 0, 0);
+        }
+        // GDI hands us B, G, R, A in that order.
+        (
+            src[offset + 2] as i32,
+            src[offset + 1] as i32,
+            src[offset] as i32,
+        )
+    };
+
+    for y in 0..dst_h as i32 {
+        for x in 0..dst_w as i32 {
+            let (r, g, b) = sample(x, y);
+            dst[y as usize * dst_w as usize + x as usize] = luma(r, g, b);
+        }
+    }
+
+    let chroma = &mut dst[y_len..];
+    for y in (0..dst_h as i32).step_by(2) {
+        for x in (0..dst_w as i32).step_by(2) {
+            let mut r = 0;
+            let mut g = 0;
+            let mut b = 0;
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (pr, pg, pb) = sample(x + dx, y + dy);
+                    r += pr;
+                    g += pg;
+                    b += pb;
+                }
+            }
+            let (u, v) = chroma_for(r / 4, g / 4, b / 4);
+            let row = (y / 2) as usize;
+            let column = (x / 2) as usize * 2;
+            chroma[row * dst_w as usize + column] = u;
+            chroma[row * dst_w as usize + column + 1] = v;
+        }
+    }
+}
+
+/// BT.709 studio-range luma.
+#[inline]
+fn luma(r: i32, g: i32, b: i32) -> u8 {
+    clamp_u8(((47 * r + 157 * g + 16 * b) >> 8) + 16)
+}
+
+/// BT.709 studio-range chroma (U, V).
+#[inline]
+fn chroma_for(r: i32, g: i32, b: i32) -> (u8, u8) {
+    let u = ((-26 * r - 87 * g + 112 * b) >> 8) + 128;
+    let v = ((112 * r - 102 * g - 10 * b) >> 8) + 128;
+    (clamp_u8(u), clamp_u8(v))
+}
+
+#[inline]
+fn clamp_u8(value: i32) -> u8 {
+    value.clamp(0, 255) as u8
+}
+
+// ---------------------------------------------------------------------------
+// Windows implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod windows_impl {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    /// How long `recordStart` waits for the first encoded frame before it
+    /// answers anyway.
+    const START_TIMEOUT: Duration = Duration::from_secs(20);
+    /// How long `recordStop` waits for the recording thread to finalize.
+    const STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn internal(message: impl Into<String>) -> ProtocolError {
+        ProtocolError::new(message, ErrorCode::InternalError)
+    }
+
+    /// Counters a running (or finished) recording publishes to `recordStatus`
+    /// and `recordStop`. Plain numbers, so the recording thread never blocks on
+    /// the registry lock.
+    #[derive(Default)]
+    struct RecordStats {
+        video_frames: AtomicU64,
+        audio_frames: AtomicU64,
+        width: AtomicU32,
+        height: AtomicU32,
+        /// First fatal problem seen by the recording thread, if any.
+        error: Mutex<Option<String>>,
+        /// Non-fatal problem with the audio track (no device, a format we
+        /// cannot convert, ...). The recording still produces a video file.
+        audio_warning: Mutex<Option<String>>,
+    }
+
+    /// One recording the helper knows about: running until `stop` is set, then
+    /// finished-but-uncollected until the next `recordStart` replaces it.
+    struct Recording {
+        id: String,
+        path: PathBuf,
+        fps: u32,
+        audio: AudioMode,
+        stats: Arc<RecordStats>,
+        stop: Arc<Mutex<bool>>,
+        started: Instant,
+        handle: Option<JoinHandle<()>>,
+        finished: bool,
+    }
+
+    fn registry() -> &'static Mutex<Option<Recording>> {
+        static ACTIVE: OnceLock<Mutex<Option<Recording>>> = OnceLock::new();
+        ACTIVE.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Everything one recording run needs, parsed once at `recordStart` time.
+    #[derive(Clone)]
+    struct RecordParams {
+        /// Window handle, already resolved from the caller's root ref.
+        hwnd: isize,
+        fps: u32,
+        max_duration: Duration,
+        audio: AudioMode,
+        path: PathBuf,
+    }
+
+    pub(super) fn start(
+        store: &RefStore,
+        target: &WindowRef,
+        args: &Value,
+    ) -> Result<Value, ProtocolError> {
+        let native = store.get_window(target).ok_or_else(|| {
+            ProtocolError::new(
+                format!("Window ref '{target}' not found"),
+                ErrorCode::TargetNotFound,
+            )
+        })?;
+
+        let fps = args
+            .get("fps")
+            .and_then(Value::as_u64)
+            .map(|value| value.clamp(1, MAX_FPS as u64) as u32)
+            .unwrap_or(DEFAULT_FPS);
+        let max_duration_ms = args
+            .get("maxDurationMs")
+            .and_then(Value::as_u64)
+            .map(|value| value.clamp(1_000, MAX_MAX_DURATION_MS))
+            .unwrap_or(DEFAULT_MAX_DURATION_MS);
+        let audio = AudioMode::parse(args)?;
+
+        let mut guard = registry()
+            .lock()
+            .map_err(|_| internal("recording registry lock poisoned"))?;
+        if let Some(active) = guard.as_ref() {
+            if !active.finished {
+                return Err(invalid(format!(
+                    "recording '{}' is still running; stop it first",
+                    active.id
+                )));
+            }
+        }
+
+        let id = crate::state::StateId::fresh("rec");
+        let path = match args.get("outputPath").and_then(Value::as_str) {
+            Some(raw) if !raw.trim().is_empty() => resolve_output_path(raw.trim())?,
+            _ => std::env::temp_dir().join(format!("aimux-{id}.mp4")),
+        };
+
+        let params = RecordParams {
+            hwnd: native.raw(),
+            fps,
+            max_duration: Duration::from_millis(max_duration_ms),
+            audio,
+            path,
+        };
+        let stats = Arc::new(RecordStats::default());
+        let stop = Arc::new(Mutex::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
+        let thread_params = params.clone();
+        let thread_stats = Arc::clone(&stats);
+        let thread_stop = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("aimux-record".to_owned())
+            .spawn(move || record_thread(thread_params, thread_stop, thread_stats, ready_tx))
+            .map_err(|e| internal(format!("could not start the recording thread: {e}")))?;
+
+        let started = match ready_rx.recv_timeout(START_TIMEOUT) {
+            Ok(Ok(())) => Instant::now(),
+            Ok(Err(message)) => {
+                let _ = handle.join();
+                return Err(ProtocolError::new(message, ErrorCode::CaptureFailed));
+            }
+            Err(_) => {
+                // Still starting up. Leave it recording rather than killing a
+                // run the caller may still collect with recordStop.
+                Instant::now()
+            }
+        };
+
+        let response = json!({
+            "recordingId": id,
+            "target": target.to_string(),
+            "path": params.path.to_string_lossy(),
+            "width": stats.width.load(Ordering::Relaxed),
+            "height": stats.height.load(Ordering::Relaxed),
+            "fps": fps,
+            "maxDurationMs": max_duration_ms,
+            "audio": audio.label(),
+            "hasAudio": audio != AudioMode::None,
+            "audioWarning": stats.audio_warning.lock().ok().and_then(|w| w.clone()),
+            "startedAtMs": now_unix_ms(),
+        });
+
+        *guard = Some(Recording {
+            id,
+            path: params.path,
+            fps,
+            audio,
+            stats,
+            stop,
+            started,
+            handle: Some(handle),
+            finished: false,
+        });
+        Ok(response)
+    }
+
+    pub(super) fn stop(args: &Value) -> Result<Value, ProtocolError> {
+        let requested = args.get("recordingId").and_then(Value::as_str);
+        let timeout = Duration::from_millis(
+            args.get("timeoutMs")
+                .and_then(Value::as_u64)
+                .map(|value| value.clamp(1_000, 120_000))
+                .unwrap_or(STOP_TIMEOUT.as_millis() as u64),
+        );
+
+        let mut guard = registry()
+            .lock()
+            .map_err(|_| internal("recording registry lock poisoned"))?;
+        let recording = guard
+            .as_mut()
+            .ok_or_else(|| invalid("no recording has been started"))?;
+        if let Some(requested) = requested {
+            if requested != recording.id {
+                return Err(invalid(format!(
+                    "recording '{requested}' is not the active recording ('{}')",
+                    recording.id
+                )));
+            }
+        }
+
+        if let Ok(mut flag) = recording.stop.lock() {
+            *flag = true;
+        }
+
+        if !recording.finished {
+            if let Some(handle) = recording.handle.take() {
+                let deadline = Instant::now() + timeout;
+                while !handle.is_finished() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if !handle.is_finished() {
+                    // Put the handle back: the caller can try again, and the
+                    // file keeps growing until the thread decides to stop.
+                    recording.handle = Some(handle);
+                    return Err(ProtocolError::new(
+                        "the recording thread did not finish in time; try recordStop again",
+                        ErrorCode::InternalError,
+                    ));
+                }
+                let _ = handle.join();
+            }
+            recording.finished = true;
+        }
+
+        Ok(summary(recording))
+    }
+
+    pub(super) fn status(args: &Value) -> Result<Value, ProtocolError> {
+        let requested = args.get("recordingId").and_then(Value::as_str);
+        let guard = registry()
+            .lock()
+            .map_err(|_| internal("recording registry lock poisoned"))?;
+        let Some(recording) = guard.as_ref() else {
+            return Ok(json!({ "active": false }));
+        };
+        if let Some(requested) = requested {
+            if requested != recording.id {
+                return Ok(json!({ "active": false, "recordingId": recording.id }));
+            }
+        }
+        Ok(json!({
+            "active": !recording.finished,
+            "recordingId": recording.id,
+            "path": recording.path.to_string_lossy(),
+            "elapsedMs": recording.started.elapsed().as_millis() as u64,
+            "width": recording.stats.width.load(Ordering::Relaxed),
+            "height": recording.stats.height.load(Ordering::Relaxed),
+            "fps": recording.fps,
+            "videoFrames": recording.stats.video_frames.load(Ordering::Relaxed),
+            "audioFrames": recording.stats.audio_frames.load(Ordering::Relaxed),
+            "audio": recording.audio.label(),
+            "audioWarning": recording.stats.audio_warning.lock().ok().and_then(|w| w.clone()),
+            "error": recording.stats.error.lock().ok().and_then(|e| e.clone()),
+            "finished": recording.finished,
+        }))
+    }
+
+    fn summary(recording: &Recording) -> Value {
+        let bytes = std::fs::metadata(&recording.path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        json!({
+            "recordingId": recording.id,
+            "path": recording.path.to_string_lossy(),
+            "bytes": bytes,
+            "durationMs": recording.started.elapsed().as_millis() as u64,
+            "width": recording.stats.width.load(Ordering::Relaxed),
+            "height": recording.stats.height.load(Ordering::Relaxed),
+            "fps": recording.fps,
+            "videoFrames": recording.stats.video_frames.load(Ordering::Relaxed),
+            "audioFrames": recording.stats.audio_frames.load(Ordering::Relaxed),
+            "audio": recording.audio.label(),
+            "hasAudio": recording.audio != AudioMode::None,
+            "audioWarning": recording.stats.audio_warning.lock().ok().and_then(|w| w.clone()),
+            "error": recording.stats.error.lock().ok().and_then(|e| e.clone()),
+            "stopped": true,
+        })
+    }
+
+    fn now_unix_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Resolve the caller's output path: absolute, `.mp4`, parent directory
+    /// made on demand. A relative path is refused rather than guessed at,
+    /// because the helper's working directory is not the user's.
+    fn resolve_output_path(raw: &str) -> Result<PathBuf, ProtocolError> {
+        let mut path = PathBuf::from(raw);
+        if !path.is_absolute() {
+            return Err(invalid(format!("outputPath must be absolute (got '{raw}')")));
+        }
+        if path.extension().is_none() {
+            path.set_extension("mp4");
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ProtocolError::new(
+                    format!("could not create {}: {e}", parent.display()),
+                    ErrorCode::InvalidRequest,
+                )
+            })?;
+        }
+        Ok(path)
+    }
+
+    /// Capture frames until asked to stop, mixing in audio when it is available.
+    ///
+    /// The thread owns the sink writer from creation to finalize, so the MP4 is
+    /// written by exactly one thread and needs no locking.
+    fn record_thread(
+        params: RecordParams,
+        stop: Arc<Mutex<bool>>,
+        stats: Arc<RecordStats>,
+        ready: mpsc::Sender<Result<(), String>>,
+    ) {
+        // A recording thread does its own COM/MF setup: the helper's request
+        // workers have their own apartment and must not be disturbed.
+        let com = unsafe { com::CoInitializeEx(None, com::COINIT_MULTITHREADED) };
+        let started = Instant::now();
+
+        let outcome = run_recording(&params, &stop, &stats, &ready, started);
+        if let Err(message) = outcome {
+            if let Ok(mut slot) = stats.error.lock() {
+                if slot.is_none() {
+                    *slot = Some(message.clone());
+                }
+            }
+            // Before the first frame nothing has been handed to the caller, so
+            // the failure is reported through `recordStart` instead.
+            let _ = ready.send(Err(message));
+        }
+
+        let _ = unsafe { mf::MFShutdown() };
+        if com.is_ok() {
+            unsafe { com::CoUninitialize() };
+        }
+    }
+
+    fn run_recording(
+        params: &RecordParams,
+        stop: &Arc<Mutex<bool>>,
+        stats: &Arc<RecordStats>,
+        ready: &mpsc::Sender<Result<(), String>>,
+        started: Instant,
+    ) -> Result<(), String> {
+        unsafe { mf::MFStartup(mf::MF_VERSION, mf::MFSTARTUP_FULL) }
+            .map_err(|e| format!("Media Foundation is unavailable on this system: {e}"))?;
+
+        let hwnd = windows::Win32::Foundation::HWND(params.hwnd as *mut _);
+
+        let first = crate::capture::capture_bgra(hwnd).map_err(|e| e.message)?;
+        let (frame_w, frame_h) = even_dimensions(first.width, first.height);
+        if frame_w == 0 || frame_h == 0 {
+            return Err("the target window has no capturable area".to_owned());
+        }
+
+        // Audio is a nice-to-have: a device that refuses to open must not cost
+        // the caller the video, so degrade to video-only and say why.
+        let mut audio_warning: Option<String> = None;
+        let mut audio = match params.audio {
+            AudioMode::None => None,
+            mode => match AudioCapture::open(mode) {
+                Ok(capture) => match capture.start() {
+                    Ok(()) => Some(capture),
+                    Err(reason) => {
+                        audio_warning = Some(format!("audio capture unavailable: {reason}"));
+                        None
+                    }
+                },
+                Err(reason) => {
+                    audio_warning = Some(format!("audio capture unavailable: {reason}"));
+                    None
+                }
+            },
+        };
+
+        let mut writer = Encoder::create(&params.path, frame_w, frame_h, params.fps, audio.as_ref())
+            .map_err(|e| format!("could not create the MP4 encoder: {e}"))?;
+
+        stats.width.store(frame_w, Ordering::Relaxed);
+        stats.height.store(frame_h, Ordering::Relaxed);
+        if let Ok(mut slot) = stats.audio_warning.lock() {
+            *slot = audio_warning;
+        }
+        // Everything past this point is collectable with `recordStop`.
+        let _ = ready.send(Ok(()));
+
+        let interval = Duration::from_nanos(1_000_000_000u64 / params.fps as u64);
+        let mut next_frame = Instant::now();
+        let mut consecutive_failures = 0u32;
+        let mut pending = Some(first);
+
+        loop {
+            let should_stop = stop.lock().map(|flag| *flag).unwrap_or(true)
+                || started.elapsed() >= params.max_duration;
+            if should_stop {
+                break;
+            }
+
+            let captured = match pending.take() {
+                Some(frame) => Ok(frame),
+                None => crate::capture::capture_bgra(hwnd),
+            };
+            match captured {
+                Ok(frame) => {
+                    consecutive_failures = 0;
+                    let timestamp = started.elapsed().as_nanos() as i64 / 100;
+                    if let Err(message) =
+                        writer.write_video(&frame, frame_w, frame_h, timestamp, params.fps)
+                    {
+                        // Encoder trouble is fatal: later frames cannot help.
+                        return Err(format!("video encoding failed: {message}"));
+                    }
+                    stats.video_frames.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures > params.fps * 5 {
+                        // Five seconds without a frame: the window is gone.
+                        if let Ok(mut slot) = stats.error.lock() {
+                            if slot.is_none() {
+                                *slot = Some(format!("window capture stopped: {}", error.message));
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let mut audio_failed = false;
+            if let Some(capture) = audio.as_mut() {
+                match capture.drain(&mut writer, started) {
+                    Ok(frames) => {
+                        stats.audio_frames.fetch_add(frames, Ordering::Relaxed);
+                    }
+                    Err(reason) => {
+                        if let Ok(mut slot) = stats.audio_warning.lock() {
+                            *slot = Some(format!("audio capture stopped: {reason}"));
+                        }
+                        audio_failed = true;
+                    }
+                }
+            }
+            if audio_failed {
+                audio = None;
+            }
+
+            next_frame += interval;
+            let now = Instant::now();
+            if next_frame > now {
+                std::thread::sleep(next_frame - now);
+            } else {
+                next_frame = now;
+            }
+        }
+
+        if let Some(capture) = audio.as_ref() {
+            capture.stop();
+        }
+        // Top the audio track up to the video length so the file has sound for
+        // its whole duration even if the last pull brought nothing back.
+        if audio.is_some() {
+            let elapsed_hns = started.elapsed().as_nanos() as i64 / 100;
+            let _ = writer.write_audio(&[], elapsed_hns);
+        }
+        writer
+            .finish()
+            .map_err(|e| format!("finalizing the MP4 failed: {e}"))?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Media Foundation encode path
+    // -----------------------------------------------------------------------
+
+    mod mf {
+        pub use windows::Win32::Media::MediaFoundation::*;
+    }
+
+    mod com {
+        pub use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    }
+
+    mod wasapi {
+        pub use windows::Win32::Media::Audio::*;
+    }
+
+    /// The MMDeviceEnumerator coclass. The `windows` crate does not ship this
+    /// class id, so it is spelled out here.
+    const CLSID_MM_DEVICE_ENUMERATOR: windows::core::GUID =
+        windows::core::GUID::from_u128(0xbcde0395_e52f_467c_8e3d_c4579291692e);
+
+    struct Encoder {
+        writer: mf::IMFSinkWriter,
+        video_stream: u32,
+        audio_stream: Option<u32>,
+        /// Scratch buffer, reused for every frame so a long recording does not
+        /// churn allocations.
+        nv12: Vec<u8>,
+        sample_rate: u32,
+        channels: u16,
+        audio_written: u64,
+    }
+
+    impl Encoder {
+        fn create(
+            path: &std::path::Path,
+            width: u32,
+            height: u32,
+            fps: u32,
+            audio: Option<&AudioCapture>,
+        ) -> windows::core::Result<Self> {
+            let url = wide_path(path);
+            let writer = unsafe {
+                mf::MFCreateSinkWriterFromURL(
+                    windows::core::PCWSTR(url.as_ptr()),
+                    None::<&mf::IMFByteStream>,
+                    None::<&mf::IMFAttributes>,
+                )?
+            };
+
+            let video_out = unsafe { mf::MFCreateMediaType()? };
+            set_guid(&video_out, &mf::MF_MT_MAJOR_TYPE, &mf::MFMediaType_Video)?;
+            set_guid(&video_out, &mf::MF_MT_SUBTYPE, &mf::MFVideoFormat_H264)?;
+            set_u32(&video_out, &mf::MF_MT_AVG_BITRATE, video_bitrate(width, height, fps))?;
+            set_u32(
+                &video_out,
+                &mf::MF_MT_INTERLACE_MODE,
+                mf::MFVideoInterlace_Progressive.0 as u32,
+            )?;
+            set_size(&video_out, &mf::MF_MT_FRAME_SIZE, width, height)?;
+            set_ratio(&video_out, &mf::MF_MT_FRAME_RATE, fps, 1)?;
+            set_ratio(&video_out, &mf::MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
+            let video_stream = unsafe { writer.AddStream(&video_out)? };
+
+            let video_in = unsafe { mf::MFCreateMediaType()? };
+            set_guid(&video_in, &mf::MF_MT_MAJOR_TYPE, &mf::MFMediaType_Video)?;
+            set_guid(&video_in, &mf::MF_MT_SUBTYPE, &mf::MFVideoFormat_NV12)?;
+            set_u32(
+                &video_in,
+                &mf::MF_MT_INTERLACE_MODE,
+                mf::MFVideoInterlace_Progressive.0 as u32,
+            )?;
+            set_size(&video_in, &mf::MF_MT_FRAME_SIZE, width, height)?;
+            set_ratio(&video_in, &mf::MF_MT_FRAME_RATE, fps, 1)?;
+            set_ratio(&video_in, &mf::MF_MT_PIXEL_ASPECT_RATIO, 1, 1)?;
+            // Top-down rows, one row of pixels per stride: the layout
+            // `bgra_to_nv12` writes.
+            set_u32(&video_in, &mf::MF_MT_DEFAULT_STRIDE, width)?;
+            set_u32(&video_in, &mf::MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+            unsafe { writer.SetInputMediaType(video_stream, &video_in, None::<&mf::IMFAttributes>)? };
+
+            let mut audio_stream = None;
+            let mut sample_rate = 0u32;
+            let mut channels = 0u16;
+            if let Some(capture) = audio {
+                let out = unsafe { mf::MFCreateMediaType()? };
+                set_guid(&out, &mf::MF_MT_MAJOR_TYPE, &mf::MFMediaType_Audio)?;
+                set_guid(&out, &mf::MF_MT_SUBTYPE, &mf::MFAudioFormat_AAC)?;
+                set_u32(&out, &mf::MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                set_u32(&out, &mf::MF_MT_AUDIO_SAMPLES_PER_SECOND, capture.sample_rate)?;
+                set_u32(&out, &mf::MF_MT_AUDIO_NUM_CHANNELS, capture.out_channels as u32)?;
+                // 128 kbps: plenty for screen-recording sound.
+                set_u32(&out, &mf::MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16_000)?;
+                let stream = unsafe { writer.AddStream(&out)? };
+
+                let input = unsafe { mf::MFCreateMediaType()? };
+                set_guid(&input, &mf::MF_MT_MAJOR_TYPE, &mf::MFMediaType_Audio)?;
+                set_guid(&input, &mf::MF_MT_SUBTYPE, &mf::MFAudioFormat_PCM)?;
+                set_u32(&input, &mf::MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+                set_u32(&input, &mf::MF_MT_AUDIO_SAMPLES_PER_SECOND, capture.sample_rate)?;
+                set_u32(&input, &mf::MF_MT_AUDIO_NUM_CHANNELS, capture.out_channels as u32)?;
+                set_u32(
+                    &input,
+                    &mf::MF_MT_AUDIO_BLOCK_ALIGNMENT,
+                    capture.out_channels as u32 * 2,
+                )?;
+                set_u32(
+                    &input,
+                    &mf::MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+                    capture.sample_rate * capture.out_channels as u32 * 2,
+                )?;
+                unsafe { writer.SetInputMediaType(stream, &input, None::<&mf::IMFAttributes>)? };
+
+                audio_stream = Some(stream);
+                sample_rate = capture.sample_rate;
+                channels = capture.out_channels;
+            }
+
+            unsafe { writer.BeginWriting()? };
+
+            Ok(Self {
+                writer,
+                video_stream,
+                audio_stream,
+                nv12: vec![0u8; nv12_len(width, height)],
+                sample_rate,
+                channels,
+                audio_written: 0,
+            })
+        }
+
+        /// Encode one captured frame. The frame may differ in size from the
+        /// stream (the window was resized): it is centred, cropped or padded.
+        fn write_video(
+            &mut self,
+            frame: &crate::capture::Frame,
+            width: u32,
+            height: u32,
+            timestamp_hns: i64,
+            fps: u32,
+        ) -> windows::core::Result<()> {
+            let (crop_x, crop_y) = center_offsets(frame.width, frame.height, width, height);
+            bgra_to_nv12(
+                &frame.pixels,
+                frame.width,
+                frame.height,
+                crop_x,
+                crop_y,
+                width,
+                height,
+                &mut self.nv12,
+            );
+
+            let buffer = unsafe { mf::MFCreateMemoryBuffer(self.nv12.len() as u32)? };
+            unsafe {
+                let mut target: *mut u8 = std::ptr::null_mut();
+                buffer.Lock(&mut target, None, None)?;
+                std::ptr::copy_nonoverlapping(self.nv12.as_ptr(), target, self.nv12.len());
+                buffer.Unlock()?;
+                buffer.SetCurrentLength(self.nv12.len() as u32)?;
+            }
+
+            let sample = unsafe { mf::MFCreateSample()? };
+            unsafe {
+                sample.AddBuffer(&buffer)?;
+                sample.SetSampleTime(timestamp_hns)?;
+                sample.SetSampleDuration(10_000_000i64 / fps.max(1) as i64)?;
+                self.writer.WriteSample(self.video_stream, &sample)?;
+            }
+            Ok(())
+        }
+
+        /// Write one block of 16-bit PCM, padding silence up to the wall clock
+        /// so the audio track stays aligned with the video.
+        fn write_audio(&mut self, samples: &[i16], elapsed_hns: i64) -> windows::core::Result<()> {
+            let Some(stream) = self.audio_stream else {
+                return Ok(());
+            };
+            if self.sample_rate == 0 || self.channels == 0 {
+                return Ok(());
+            }
+            let block = self.channels as usize;
+            let target_samples =
+                (elapsed_hns.max(0) as u128 * self.sample_rate as u128 / 10_000_000) as u64;
+
+            let mut pcm: Vec<i16> = Vec::new();
+            let captured = samples.len() as u64;
+            if target_samples > self.audio_written + captured {
+                let missing = (target_samples - self.audio_written - captured) as usize;
+                pcm.resize(missing * block, 0);
+            }
+            pcm.extend_from_slice(samples);
+            let frames = (pcm.len() / block) as u64;
+            if frames == 0 {
+                return Ok(());
+            }
+
+            let buffer = unsafe { mf::MFCreateMemoryBuffer((pcm.len() * 2) as u32)? };
+            unsafe {
+                let mut target: *mut u8 = std::ptr::null_mut();
+                buffer.Lock(&mut target, None, None)?;
+                std::ptr::copy_nonoverlapping(pcm.as_ptr() as *const u8, target, pcm.len() * 2);
+                buffer.Unlock()?;
+                buffer.SetCurrentLength((pcm.len() * 2) as u32)?;
+            }
+
+            let start_hns =
+                (self.audio_written as i128 * 10_000_000i128 / self.sample_rate as i128) as i64;
+            let duration_hns = (frames as i128 * 10_000_000i128 / self.sample_rate as i128) as i64;
+
+            let sample = unsafe { mf::MFCreateSample()? };
+            unsafe {
+                sample.AddBuffer(&buffer)?;
+                sample.SetSampleTime(start_hns)?;
+                sample.SetSampleDuration(duration_hns.max(1))?;
+                self.writer.WriteSample(stream, &sample)?;
+            }
+            self.audio_written += frames;
+            Ok(())
+        }
+
+        fn finish(&mut self) -> windows::core::Result<()> {
+            unsafe { self.writer.Finalize() }
+        }
+    }
+
+    fn set_guid(
+        target: &mf::IMFMediaType,
+        key: &windows::core::GUID,
+        value: &windows::core::GUID,
+    ) -> windows::core::Result<()> {
+        // IMFMediaType derefs to IMFAttributes, which is where setters live.
+        unsafe { target.SetGUID(key, value) }
+    }
+
+    fn set_u32(
+        target: &mf::IMFMediaType,
+        key: &windows::core::GUID,
+        value: u32,
+    ) -> windows::core::Result<()> {
+        unsafe { target.SetUINT32(key, value) }
+    }
+
+    /// Two packed 32-bit halves, the encoding Media Foundation uses for sizes
+    /// and ratios (`MFSetAttributeSize` does the same thing in C++).
+    fn set_size(
+        target: &mf::IMFMediaType,
+        key: &windows::core::GUID,
+        width: u32,
+        height: u32,
+    ) -> windows::core::Result<()> {
+        unsafe { target.SetUINT64(key, ((width as u64) << 32) | height as u64) }
+    }
+
+    fn set_ratio(
+        target: &mf::IMFMediaType,
+        key: &windows::core::GUID,
+        numerator: u32,
+        denominator: u32,
+    ) -> windows::core::Result<()> {
+        unsafe { target.SetUINT64(key, ((numerator as u64) << 32) | denominator as u64) }
+    }
+
+    fn wide_path(path: &std::path::Path) -> Vec<u16> {
+        path.as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // WASAPI audio capture
+    // -----------------------------------------------------------------------
+
+    /// Sample rates the Media Foundation AAC encoder accepts.
+    const AAC_SAMPLE_RATES: [u32; 9] = [
+        8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+    ];
+
+    /// The rate we ask WASAPI to convert to, and the rate we hand the encoder.
+    const TARGET_SAMPLE_RATE: u32 = 48_000;
+
+    struct AudioCapture {
+        client: wasapi::IAudioClient,
+        capture: wasapi::IAudioCaptureClient,
+        /// Rate of the stream we actually opened.
+        sample_rate: u32,
+        /// Channels in each device frame (may exceed what we keep).
+        source_channels: u16,
+        /// Channels we hand the encoder: one or two.
+        out_channels: u16,
+        /// True when the device hands us 32-bit floats to convert ourselves.
+        is_float: bool,
+    }
+
+    impl AudioCapture {
+        fn open(mode: AudioMode) -> Result<Self, String> {
+            unsafe {
+                let enumerator: wasapi::IMMDeviceEnumerator =
+                    windows::Win32::System::Com::CoCreateInstance(
+                        &CLSID_MM_DEVICE_ENUMERATOR,
+                        None::<&windows::core::IUnknown>,
+                        windows::Win32::System::Com::CLSCTX_ALL,
+                    )
+                    .map_err(|e| format!("no audio endpoint enumerator: {e}"))?;
+
+                let (data_flow, flags) = match mode {
+                    // Loopback captures what the machine is playing instead of
+                    // what a microphone hears.
+                    AudioMode::System => (wasapi::eRender, wasapi::AUDCLNT_STREAMFLAGS_LOOPBACK),
+                    _ => (wasapi::eCapture, 0),
+                };
+                let device = enumerator
+                    .GetDefaultAudioEndpoint(data_flow, wasapi::eConsole)
+                    .map_err(|e| format!("no default audio endpoint: {e}"))?;
+                let client: wasapi::IAudioClient = device
+                    .Activate(windows::Win32::System::Com::CLSCTX_ALL, None)
+                    .map_err(|e| format!("audio endpoint refused activation: {e}"))?;
+
+                let mix = client
+                    .GetMixFormat()
+                    .map_err(|e| format!("could not read the device format: {e}"))?;
+                if mix.is_null() {
+                    return Err("the device reported no mix format".to_owned());
+                }
+                let parsed = parse_mix_format(mix);
+
+                // 500 ms of slack per pull, the usual shared-mode choice.
+                let hns_buffer = 10_000_000i64 / 2;
+                let out_channels = if parsed.channels >= 2 { 2u16 } else { 1u16 };
+                let pcm = wasapi::WAVEFORMATEX {
+                    wFormatTag: 1, // WAVE_FORMAT_PCM
+                    nChannels: out_channels,
+                    nSamplesPerSec: TARGET_SAMPLE_RATE,
+                    nAvgBytesPerSec: TARGET_SAMPLE_RATE * out_channels as u32 * 2,
+                    nBlockAlign: out_channels * 2,
+                    wBitsPerSample: 16,
+                    cbSize: 0,
+                };
+                let convert = wasapi::AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                    | wasapi::AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+                // Preferred: let the audio engine hand us 16-bit PCM at a rate
+                // the AAC encoder takes.
+                let opened = match client.Initialize(
+                    wasapi::AUDCLNT_SHAREMODE_SHARED,
+                    flags | convert,
+                    hns_buffer,
+                    0,
+                    &pcm,
+                    None,
+                ) {
+                    Ok(()) => Ok((TARGET_SAMPLE_RATE, out_channels, out_channels, false)),
+                    Err(_) => {
+                        // No converter for this endpoint (loopback capture
+                        // refuses it on some drivers): take the device's own
+                        // format and convert by hand instead.
+                        if !AAC_SAMPLE_RATES.contains(&parsed.sample_rate) {
+                            Err(format!(
+                                "the device runs at {} Hz, which the AAC encoder does not take",
+                                parsed.sample_rate
+                            ))
+                        } else {
+                            client
+                                .Initialize(
+                                    wasapi::AUDCLNT_SHAREMODE_SHARED,
+                                    flags,
+                                    hns_buffer,
+                                    0,
+                                    mix,
+                                    None,
+                                )
+                                .map_err(|e| format!("audio client refused to start: {e}"))?;
+                            Ok((
+                                parsed.sample_rate,
+                                parsed.channels,
+                                out_channels,
+                                parsed.is_float,
+                            ))
+                        }
+                    }
+                };
+
+                windows::Win32::System::Com::CoTaskMemFree(Some(mix as *const std::ffi::c_void));
+                let (sample_rate, source_channels, out_channels, is_float) = opened?;
+
+                let capture: wasapi::IAudioCaptureClient = client
+                    .GetService()
+                    .map_err(|e| format!("no capture service on the endpoint: {e}"))?;
+
+                Ok(Self {
+                    client,
+                    capture,
+                    sample_rate,
+                    source_channels,
+                    out_channels,
+                    is_float,
+                })
+            }
+        }
+
+        fn start(&self) -> Result<(), String> {
+            unsafe { self.client.Start() }.map_err(|e| e.to_string())
+        }
+
+        fn stop(&self) {
+            unsafe {
+                let _ = self.client.Stop();
+            }
+        }
+
+        /// Pull whatever the device has buffered into the encoder. Returns how
+        /// many device frames were written.
+        fn drain(&mut self, encoder: &mut Encoder, started: Instant) -> Result<u64, String> {
+            let mut total = 0u64;
+            loop {
+                let packet = match unsafe { self.capture.GetNextPacketSize() } {
+                    Ok(size) => size,
+                    Err(e) => return Err(e.to_string()),
+                };
+                if packet == 0 {
+                    break;
+                }
+                let mut data: *mut u8 = std::ptr::null_mut();
+                let mut frames = 0u32;
+                let mut flags = 0u32;
+                if let Err(e) = unsafe {
+                    self.capture
+                        .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
+                } {
+                    return Err(e.to_string());
+                }
+                if frames == 0 {
+                    let _ = unsafe { self.capture.ReleaseBuffer(0) };
+                    continue;
+                }
+                let silent = flags & wasapi::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+                // SAFETY: `GetBuffer` just handed us `frames` frames of the
+                // format the client was initialized with.
+                let samples = unsafe { self.convert(data, frames, silent) };
+                let _ = unsafe { self.capture.ReleaseBuffer(frames) };
+
+                let elapsed_hns = started.elapsed().as_nanos() as i64 / 100;
+                if let Err(e) = encoder.write_audio(&samples, elapsed_hns) {
+                    return Err(e.to_string());
+                }
+                total += frames as u64;
+            }
+            Ok(total)
+        }
+
+        /// Device samples → interleaved 16-bit stereo.
+        ///
+        /// # Safety
+        ///
+        /// `data` must point at `frames` frames in the format the client was
+        /// initialized with, which is what `GetBuffer` guarantees.
+        unsafe fn convert(&self, data: *mut u8, frames: u32, silent: bool) -> Vec<i16> {
+            let source_channels = self.source_channels as usize;
+            let out_channels = self.out_channels as usize;
+            let mut out = vec![0i16; frames as usize * out_channels];
+            if silent || data.is_null() {
+                return out;
+            }
+            for frame in 0..frames as usize {
+                for channel in 0..out_channels {
+                    // More device channels than we keep: take the first two.
+                    let index = frame * source_channels + channel;
+                    out[frame * out_channels + channel] = if self.is_float {
+                        let value = *(data as *const f32).add(index);
+                        (value.clamp(-1.0, 1.0) * 32_767.0) as i16
+                    } else {
+                        *(data as *const i16).add(index)
+                    };
+                }
+            }
+            out
+        }
+    }
+
+    struct ParsedFormat {
+        sample_rate: u32,
+        channels: u16,
+        is_float: bool,
+    }
+
+    /// Read a `WAVEFORMATEX` — or the `WAVEFORMATEXTENSIBLE` that shared-mode
+    /// endpoints normally hand out — into the few fields we care about.
+    ///
+    /// Both structs are `repr(packed)`, so every field is copied out by value
+    /// and no reference into the packed struct is ever taken.
+    fn parse_mix_format(format: *const wasapi::WAVEFORMATEX) -> ParsedFormat {
+        const WAVE_FORMAT_PCM: u16 = 1;
+        const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+        const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+        const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: windows::core::GUID =
+            windows::core::GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+        let base = unsafe { *format };
+        let tag = base.wFormatTag;
+        let mut is_float = tag == WAVE_FORMAT_IEEE_FLOAT;
+        if tag == WAVE_FORMAT_EXTENSIBLE && base.cbSize >= 22 {
+            let extensible = unsafe { *(format as *const wasapi::WAVEFORMATEXTENSIBLE) };
+            let sub_format = extensible.SubFormat;
+            is_float = sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+        } else if tag != WAVE_FORMAT_PCM && tag != WAVE_FORMAT_IEEE_FLOAT {
+            // Anything else (a compressed or extensible-without-subformat
+            // device) is handled by the audio engine's converter instead.
+            is_float = false;
+        }
+        ParsedFormat {
+            sample_rate: base.nSamplesPerSec,
+            channels: base.nChannels.max(1),
+            is_float,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn nv12_black_frame_is_studio_black_and_neutral_chroma() {
+        let src = vec![0u8; 4 * 2 * 2];
+        let mut dst = vec![0u8; nv12_len(2, 2)];
+        bgra_to_nv12(&src, 2, 2, 0, 0, 2, 2, &mut dst);
+        assert_eq!(&dst[..4], &[16, 16, 16, 16]);
+        assert_eq!(&dst[4..], &[128, 128]);
+    }
+
+    #[test]
+    fn nv12_white_frame_reaches_studio_white() {
+        let mut src = vec![0u8; 4 * 2 * 2];
+        for pixel in src.chunks_exact_mut(4) {
+            pixel[0] = 255;
+            pixel[1] = 255;
+            pixel[2] = 255;
+        }
+        let mut dst = vec![0u8; nv12_len(2, 2)];
+        bgra_to_nv12(&src, 2, 2, 0, 0, 2, 2, &mut dst);
+        assert_eq!(dst[0], 235);
+        assert_eq!(&dst[4..], &[128, 128]);
+    }
+
+    #[test]
+    fn nv12_reads_blue_and_red_from_bgra_order() {
+        // One blue pixel then one red pixel: GDI hands us BGRA, so the first
+        // byte of each pixel is the blue channel.
+        let mut src = vec![0u8; 4 * 2];
+        src[0] = 255; // B
+        src[6] = 255; // R
+        let mut dst = vec![0u8; nv12_len(2, 1)];
+        bgra_to_nv12(&src, 2, 1, 0, 0, 2, 1, &mut dst);
+        assert_eq!(dst[0], 41, "blue carries little luma");
+        assert_eq!(dst[1], 63, "red carries more");
+    }
+
+    #[test]
+    fn nv12_pads_with_black_when_the_destination_is_larger() {
+        let mut src = vec![0u8; 4 * 2 * 2];
+        for pixel in src.chunks_exact_mut(4) {
+            pixel[2] = 255; // red everywhere
+        }
+        let mut dst = vec![0u8; nv12_len(4, 2)];
+        // The 2x2 source sits centred in a 4x2 frame: columns 0 and 3 pad.
+        bgra_to_nv12(&src, 2, 2, 1, 0, 4, 2, &mut dst);
+        assert_eq!(dst[0], 16, "left padding column should be black");
+        assert_eq!(dst[3], 16, "right padding column should be black");
+        assert_eq!(dst[1], 63, "the red source column keeps its luma");
+    }
+
+    #[test]
+    fn nv12_crops_from_a_larger_source() {
+        let mut src = vec![0u8; 4 * 2 * 4]; // 4x2: left half red, right half blue
+        for (index, pixel) in src.chunks_exact_mut(4).enumerate() {
+            if index % 4 < 2 {
+                pixel[2] = 255;
+            } else {
+                pixel[0] = 255;
+            }
+        }
+        let mut dst = vec![0u8; nv12_len(2, 2)];
+        bgra_to_nv12(&src, 4, 2, 2, 0, 2, 2, &mut dst);
+        assert_eq!(dst[0], 41, "the cropped frame lands on the blue half");
+    }
+
+    #[test]
+    fn video_bitrate_stays_inside_the_agreed_band() {
+        assert_eq!(video_bitrate(1280, 720, 10), 921_600);
+        assert_eq!(video_bitrate(320, 200, 5), 500_000);
+        assert_eq!(video_bitrate(3840, 2160, 30), 20_000_000);
+    }
+
+    #[test]
+    fn frames_are_rounded_down_to_even_dimensions() {
+        assert_eq!(even_dimensions(1280, 721), (1280, 720));
+        assert_eq!(even_dimensions(1, 1), (0, 0));
+    }
+
+    #[test]
+    fn center_offsets_pad_and_crop_symmetrically() {
+        assert_eq!(center_offsets(100, 50, 100, 50), (0, 0));
+        assert_eq!(center_offsets(200, 100, 100, 50), (50, 25));
+        assert_eq!(center_offsets(100, 50, 200, 100), (-50, -25));
+    }
+
+    #[test]
+    fn audio_mode_defaults_to_system_sound() {
+        assert_eq!(AudioMode::parse(&json!({})).unwrap(), AudioMode::System);
+        assert_eq!(
+            AudioMode::parse(&json!({"audio": "mic"})).unwrap(),
+            AudioMode::Mic
+        );
+        assert_eq!(
+            AudioMode::parse(&json!({"audio": "none"})).unwrap(),
+            AudioMode::None
+        );
+        assert!(AudioMode::parse(&json!({"audio": "loud"})).is_err());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn other_platforms_refuse_to_record() {
+        let store = RefStore::new();
+        let target = WindowRef { id: 1 };
+        for result in [
+            start(&store, &target, &json!({})),
+            stop(&json!({})),
+            status(&json!({})),
+        ] {
+            let error = result.expect_err("recording must be refused off Windows");
+            assert_eq!(error.code, ErrorCode::UnsupportedPlatform);
+        }
+    }
+}

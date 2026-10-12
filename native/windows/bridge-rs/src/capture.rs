@@ -188,6 +188,48 @@ fn screenshot_impl(
     Ok(result)
 }
 
+/// A captured frame in top-down BGRA, exactly as GDI hands it over.
+///
+/// Screenshots swap this to RGBA and encode a PNG; the recording thread
+/// converts it straight to NV12 for the encoder.
+#[cfg(windows)]
+pub(crate) struct Frame {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Capture a whole window in BGRA, sized from its current window rect.
+///
+/// Both the screenshot path and the recording thread go through here, so a
+/// recording shows exactly what `look` would have shown.
+#[cfg(windows)]
+pub(crate) fn capture_bgra(hwnd: HWND) -> Result<Frame, ProtocolError> {
+    let (x, y, width, height) = unsafe {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return Err(ProtocolError::new(
+                "Failed to get window bounds",
+                ErrorCode::CaptureFailed,
+            ));
+        }
+        let w = (rect.right - rect.left).max(0);
+        let h = (rect.bottom - rect.top).max(0);
+        (rect.left, rect.top, w, h)
+    };
+
+    if width == 0 || height == 0 {
+        return Err(ProtocolError::new(
+            "The window has no capturable area",
+            ErrorCode::CaptureFailed,
+        ));
+    }
+
+    // SAFETY: the dimensions are positive and the HWND comes from the caller's
+    // window ref.
+    unsafe { gdi_capture_bgra(hwnd, x, y, width, height) }
+}
+
 /// Perform GDI capture of the given window and return a base64-encoded PNG.
 ///
 /// # Safety
@@ -202,6 +244,75 @@ unsafe fn gdi_capture_to_base64(
     height: i32,
     max_dimension: Option<u32>,
 ) -> Result<(String, u32, u32), ProtocolError> {
+    let frame = gdi_capture_bgra(hwnd, window_x, window_y, width, height)?;
+    let source_width = frame.width;
+    let source_height = frame.height;
+    let mut bits = frame.pixels;
+
+    // Convert BGRA → RGBA (GDI returns B,G,R,A; PNG expects R,G,B,A).
+    for chunk in bits.chunks_exact_mut(4) {
+        chunk.swap(0, 2);
+    }
+
+    let (output_width, output_height) = match max_dimension.filter(|limit| *limit > 0) {
+        Some(limit) if source_width.max(source_height) > limit => {
+            let scale = limit as f64 / source_width.max(source_height) as f64;
+            (
+                (source_width as f64 * scale).round().max(1.0) as u32,
+                (source_height as f64 * scale).round().max(1.0) as u32,
+            )
+        }
+        _ => (source_width, source_height),
+    };
+    let pixels = if (output_width, output_height) == (source_width, source_height) {
+        bits
+    } else {
+        let source = RgbaImage::from_raw(source_width, source_height, bits).ok_or_else(|| {
+            ProtocolError::new(
+                "Captured bitmap had an invalid byte length",
+                ErrorCode::CaptureFailed,
+            )
+        })?;
+        image::imageops::resize(&source, output_width, output_height, FilterType::Triangle)
+            .into_raw()
+    };
+
+    // Encode to PNG in memory.
+    let mut png_data: Vec<u8> = Vec::new();
+    {
+        let encoder = PngEncoder::new(&mut png_data);
+        encoder
+            .write_image(
+                &pixels,
+                output_width,
+                output_height,
+                ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| {
+                ProtocolError::new(
+                    format!("PNG encoding failed: {e}"),
+                    ErrorCode::CaptureFailed,
+                )
+            })?;
+    }
+
+    // Base64-encode the PNG bytes.
+    Ok((BASE64.encode(&png_data), output_width, output_height))
+}
+
+/// Render one window into a top-down BGRA buffer.
+///
+/// # Safety
+///
+/// Caller must provide a valid HWND and positive dimensions.
+#[cfg(windows)]
+unsafe fn gdi_capture_bgra(
+    hwnd: HWND,
+    window_x: i32,
+    window_y: i32,
+    width: i32,
+    height: i32,
+) -> Result<Frame, ProtocolError> {
     // Acquire the window DC.
     let hdc_window = GetDC(hwnd);
     if hdc_window.is_invalid() {
@@ -319,57 +430,11 @@ unsafe fn gdi_capture_to_base64(
         ));
     }
 
-    // Convert BGRA → RGBA (GDI returns B,G,R,A; PNG expects R,G,B,A).
-    for chunk in bits.chunks_exact_mut(4) {
-        chunk.swap(0, 2);
-    }
-
-    let source_width = width as u32;
-    let source_height = height as u32;
-    let (output_width, output_height) = match max_dimension.filter(|limit| *limit > 0) {
-        Some(limit) if source_width.max(source_height) > limit => {
-            let scale = limit as f64 / source_width.max(source_height) as f64;
-            (
-                (source_width as f64 * scale).round().max(1.0) as u32,
-                (source_height as f64 * scale).round().max(1.0) as u32,
-            )
-        }
-        _ => (source_width, source_height),
-    };
-    let pixels = if (output_width, output_height) == (source_width, source_height) {
-        bits
-    } else {
-        let source = RgbaImage::from_raw(source_width, source_height, bits).ok_or_else(|| {
-            ProtocolError::new(
-                "Captured bitmap had an invalid byte length",
-                ErrorCode::CaptureFailed,
-            )
-        })?;
-        image::imageops::resize(&source, output_width, output_height, FilterType::Triangle)
-            .into_raw()
-    };
-
-    // Encode to PNG in memory.
-    let mut png_data: Vec<u8> = Vec::new();
-    {
-        let encoder = PngEncoder::new(&mut png_data);
-        encoder
-            .write_image(
-                &pixels,
-                output_width,
-                output_height,
-                ExtendedColorType::Rgba8,
-            )
-            .map_err(|e| {
-                ProtocolError::new(
-                    format!("PNG encoding failed: {e}"),
-                    ErrorCode::CaptureFailed,
-                )
-            })?;
-    }
-
-    // Base64-encode the PNG bytes.
-    Ok((BASE64.encode(&png_data), output_width, output_height))
+    Ok(Frame {
+        width: width as u32,
+        height: height as u32,
+        pixels: bits,
+    })
 }
 
 // ---------------------------------------------------------------------------
