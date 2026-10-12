@@ -512,8 +512,8 @@ mod unit_tests {
 
         // Same as above; just check that two calls produce different IDs
         // when they succeed or the same error when they fail.
-        let result_a = screenshot(&mut store, &wref, false);
-        let result_b = screenshot(&mut store, &wref, false);
+        let result_a = screenshot(&mut store, &wref, false, None);
+        let result_b = screenshot(&mut store, &wref, false, None);
 
         let err_a = result_a.as_ref().err().map(|e| e.code);
         let err_b = result_b.as_ref().err().map(|e| e.code);

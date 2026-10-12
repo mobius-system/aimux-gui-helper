@@ -51,6 +51,10 @@ scripts/publish-helper.sh     upload the binary + update the helper manifest
   `SendInput` batch leaves the key down for under a millisecond, so no sampled
   frame ever sees it. Callers can hold the key down for N ms (capped at 5000,
   default 0).
+- **Stale call sites in the capture tests** (`capture.rs`) — two Windows-only
+  tests still called `screenshot(...)` with three arguments after upstream added
+  `max_dimension`, so `cargo test` did not compile on Windows (a release build
+  did, which is why it went unnoticed). They now pass `None`.
 
 ## Protocol
 
