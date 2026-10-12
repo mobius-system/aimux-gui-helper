@@ -141,7 +141,12 @@ fn invalid(message: impl Into<String>) -> ProtocolError {
 mod native {
     use super::*;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    use std::thread::sleep;
+    use std::time::Duration;
     use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
+
+    /// Upper bound for `keepPressdownMs`, so a caller cannot wedge a key down.
+    const MAX_PRESSDOWN_MS: u64 = 5000;
 
     pub fn open_browser_location(url: &str) -> Result<(), ProtocolError> {
         hotkey(&[VK_CONTROL], VK_L)?;
@@ -232,7 +237,18 @@ mod native {
                     .get("keys")
                     .and_then(Value::as_array)
                     .ok_or_else(|| invalid("keypress requires keys"))?;
-                send_keys(keys)?;
+                // Per-frame input pollers (games) only ever observe a key that
+                // is still down when they sample. Releasing inside the same
+                // SendInput batch leaves the key down for well under a
+                // millisecond, which such a poller never catches, so let
+                // callers ask for an explicit hold.
+                let hold_ms = request
+                    .params
+                    .get("keepPressdownMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(MAX_PRESSDOWN_MS);
+                send_keys(keys, hold_ms)?;
                 ok("unknown", "coordinates", "hid")
             }
             other => Err(ProtocolError::new(
@@ -289,16 +305,33 @@ mod native {
     }
 
     fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+        // Raw-input consumers (games and engines) identify keys by scan code,
+        // not by virtual key. A KEYBDINPUT that carries only wVk reaches them
+        // with an unmapped scan code and is discarded, so resolve the scan code
+        // here: send_keys / hotkey / send_text all funnel through this helper.
+        let mapped = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC_EX) };
+        let scan = (mapped & 0xFF) as u16;
+        // MAPVK_VK_TO_VSC_EX reports extended keys (arrows, Home/End, right
+        // Ctrl/Alt, ...) with an 0xE0/0xE1 prefix in the high byte.
+        let extended = (mapped & 0xFF00) != 0;
+        let mut flags = if up {
+            KEYEVENTF_KEYUP
+        } else {
+            KEYBD_EVENT_FLAGS(0)
+        };
+        if scan != 0 {
+            flags = flags | KEYEVENTF_SCANCODE;
+            if extended {
+                flags = flags | KEYEVENTF_EXTENDEDKEY;
+            }
+        }
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: vk,
-                    dwFlags: if up {
-                        KEYEVENTF_KEYUP
-                    } else {
-                        KEYBD_EVENT_FLAGS(0)
-                    },
+                    wScan: scan,
+                    dwFlags: flags,
                     ..Default::default()
                 },
             },
@@ -375,7 +408,7 @@ mod native {
         send(&inputs)
     }
 
-    fn send_keys(keys: &[Value]) -> Result<(), ProtocolError> {
+    fn send_keys(keys: &[Value], hold_ms: u64) -> Result<(), ProtocolError> {
         let names = keys.iter().filter_map(Value::as_str).collect::<Vec<_>>();
         if names.is_empty() {
             return Err(invalid("keypress requires at least one key"));
@@ -388,7 +421,11 @@ mod native {
             send(&[key(*vk, false)])?;
         }
         if let Some(last) = vks.last() {
-            send(&[key(*last, false), key(*last, true)])?;
+            send(&[key(*last, false)])?;
+            if hold_ms > 0 {
+                sleep(Duration::from_millis(hold_ms));
+            }
+            send(&[key(*last, true)])?;
         }
         for vk in vks[..vks.len().saturating_sub(1)].iter().rev() {
             send(&[key(*vk, true)])?;

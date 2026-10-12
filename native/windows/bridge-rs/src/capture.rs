@@ -232,8 +232,12 @@ unsafe fn gdi_capture_to_base64(
     // Select bitmap into memory DC (save old to restore later).
     let old_bitmap = SelectObject(hdc_mem, hbitmap);
 
-    // Render the window content using PrintWindow (client area).
-    let pw_ok = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(0));
+    // Render the window content using PrintWindow. PW_RENDERFULLCONTENT (0x2)
+    // is required for GPU-accelerated windows (Chromium/Electron/Qt WebEngine/
+    // DirectComposition): their pixels never land in the GDI surface, so plain
+    // PrintWindow or BitBlt returns a black frame. Chromium's own snapshot code
+    // (ui/snapshot/snapshot_win.cc) uses the same flag; available since Win 8.1.
+    let pw_ok = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(2));
     if !pw_ok.as_bool() {
         // PrintWindow can fail for various reasons.  We note it but
         // continue — the DC might still have partial content.

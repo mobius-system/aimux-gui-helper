@@ -94,7 +94,8 @@ use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, RECT, TRUE};
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 #[cfg(windows)]
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
@@ -102,11 +103,11 @@ use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetWindow,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, SetForegroundWindow, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY,
-    EVENT_OBJECT_HIDE, EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWL_EXSTYLE, GW_OWNER, MSG,
-    WINEVENT_OUTOFCONTEXT, WS_EX_DLGMODALFRAME,
+    BringWindowToTop, EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow,
+    GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
+    EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_SYSTEM_FOREGROUND,
+    GA_ROOT, GWL_EXSTYLE, GW_OWNER, MSG, WINEVENT_OUTOFCONTEXT, WS_EX_DLGMODALFRAME,
 };
 
 #[cfg(windows)]
@@ -500,8 +501,61 @@ pub fn focus_window(
         })?;
         let hwnd = HWND(native.raw() as *mut _);
         let already_focused = unsafe { GetForegroundWindow() == hwnd };
-        let focused = already_focused || unsafe { SetForegroundWindow(hwnd).as_bool() };
+        let mut focused = already_focused;
+        if !focused {
+            force_foreground_once(hwnd);
+            thread::sleep(Duration::from_millis(40));
+            focused = unsafe { GetForegroundWindow() == hwnd };
+        }
         Ok(json!({ "focused": focused, "alreadyFocused": already_focused }))
+    }
+}
+
+/// One foreground attempt that lifts Windows' foreground lock. A background
+/// process calling SetForegroundWindow directly gets rejected (the taskbar
+/// button flashes instead) — attaching our thread to the input state of the
+/// foreground (and target) thread makes the activation legal. Canonical
+/// AttachThreadInput workaround used by automation tooling.
+#[cfg(windows)]
+mod input_ffi {
+    // AttachThreadInput is missing from the windows crate's generated bindings
+    // (checked 0.58; only windows-sys/the rdl metadata have it), so declare the
+    // user32 import directly. BOOL crosses the ABI as i32.
+    #[link(name = "user32")]
+    extern "system" {
+        pub fn AttachThreadInput(idattach: u32, idattachto: u32, fattach: i32) -> i32;
+    }
+}
+
+#[cfg(windows)]
+fn force_foreground_once(target: HWND) {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == target {
+            return;
+        }
+        let our_thread = GetCurrentThreadId();
+        let mut _pid = 0u32;
+        let fg_thread = if foreground.is_invalid() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, Some(&mut _pid))
+        };
+        let target_thread = GetWindowThreadProcessId(target, Some(&mut _pid));
+        let attach_fg = fg_thread != 0 && fg_thread != our_thread
+            && input_ffi::AttachThreadInput(our_thread, fg_thread, 1) != 0;
+        let attach_target = target_thread != 0 && target_thread != our_thread
+            && input_ffi::AttachThreadInput(our_thread, target_thread, 1) != 0;
+        let _ = BringWindowToTop(target);
+        let _ = SetForegroundWindow(target);
+        // SetFocus lives in the KeyboardAndMouse module of the windows crate.
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(target);
+        if attach_fg {
+            input_ffi::AttachThreadInput(our_thread, fg_thread, 0);
+        }
+        if attach_target {
+            input_ffi::AttachThreadInput(our_thread, target_thread, 0);
+        }
     }
 }
 
@@ -524,7 +578,7 @@ pub fn ensure_foreground(hwnd: isize) -> Result<(), ProtocolError> {
             if unsafe { GetForegroundWindow() == target } {
                 return Ok(());
             }
-            let _ = unsafe { SetForegroundWindow(target) };
+            force_foreground_once(target);
             thread::sleep(Duration::from_millis(20));
         }
         if unsafe { GetForegroundWindow() == target } {
