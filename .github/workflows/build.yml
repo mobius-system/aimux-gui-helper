@@ -33,9 +33,11 @@ jobs:
         run: |
           exe=native/windows/bridge-rs/target/release/windows-bridge.exe
           sha256sum "$exe" | tee sha256.txt
+          # The binary answers `diagnostics` with its own protocol version, so
+          # the note does not repeat it and cannot go stale.
           gh release delete build -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           gh release create build "$exe" sha256.txt \
             -R "$GITHUB_REPOSITORY" \
             --title "windows-bridge build" \
-            --notes "Protocol 4, aimux patches applied. sha256.txt is the manifest source of truth." \
+            --notes "windows-bridge with the aimux patches applied. sha256.txt is the manifest source of truth." \
             --latest
