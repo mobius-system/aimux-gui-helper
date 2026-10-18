@@ -330,7 +330,7 @@ unsafe fn screen_capture_bgra(
             height,
             SRCCOPY,
         )
-        .is_ok()
+        .as_bool()
     };
 
     let mut bits = vec![0u8; (output_width as usize) * (output_height as usize) * 4];
