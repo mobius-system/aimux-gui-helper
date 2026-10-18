@@ -5,10 +5,11 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 use windows_bridge::{
-    capture, input, protocol::PROTOCOL_VERSION, record, refs::RefStore, window, ErrorCode,
-    ProtocolError, Request, Response,
+    capture, capture_fast, input, protocol::PROTOCOL_VERSION, record, refs::RefStore, window,
+    ErrorCode, ProtocolError, Request, Response,
 };
 
 #[derive(Clone, Debug)]
@@ -215,6 +216,7 @@ fn handle_request(request: &Request) -> Response {
         "diagnostics" => Ok(diagnostics()),
         "listRoots" | "listWindows" => handle_list_roots(&request.args),
         "look" | "screenshot" => handle_look(&request.args),
+        "lookFastScreenshot" => handle_look_fast_screenshot(&request.args),
         "focusWindow" => handle_focus_window(&request.args),
         "act" => handle_act(&request.args),
         "actBatch" => handle_act_batch(&request.args),
@@ -552,6 +554,143 @@ fn handle_look(args: &Value) -> Result<Value, ProtocolError> {
     }
     if let Some(image) = image_payload {
         response["image"] = image;
+    }
+    Ok(response)
+}
+
+/// Local-only fast path: capture pixels and nothing else.
+///
+/// This is intentionally a separate handler. `look` keeps building the UIA
+/// outline, the element records and the full response; this command skips all
+/// of it and returns a PNG path (or base64) plus timings. A minimal look record
+/// is still stored so coordinate acts can use the returned `lookId`.
+fn handle_look_fast_screenshot(args: &Value) -> Result<Value, ProtocolError> {
+    let started_at = Instant::now();
+    let root_ref = args
+        .get("rootRef")
+        .or_else(|| args.get("windowRef"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let window_id = args.get("windowId").and_then(Value::as_i64);
+    let max_dimension = args
+        .get("maxDimension")
+        .and_then(Value::as_u64)
+        .map(|value| value.clamp(1, 16_384) as u32);
+    let save_path = args
+        .get("savePath")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let include_base64 = args
+        .get("includeBase64")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if save_path.is_none() && !include_base64 {
+        return Err(invalid(
+            "lookFastScreenshot requires savePath or includeBase64",
+        ));
+    }
+    if root_ref.is_none() && window_id.is_none() {
+        return Err(invalid(
+            "lookFastScreenshot requires rootRef or windowId",
+        ));
+    }
+
+    let roots_missing = helper_state()
+        .lock()
+        .map_err(|_| internal("helper state lock poisoned"))?
+        .roots
+        .is_empty();
+    if roots_missing {
+        let _ = handle_list_roots(&json!({}));
+    }
+    let (mut store, roots) = {
+        let state = helper_state()
+            .lock()
+            .map_err(|_| internal("helper state lock poisoned"))?;
+        (state.store.clone(), state.roots.clone())
+    };
+
+    let (identity, root) = roots
+        .iter()
+        .find(|(_, root)| {
+            root_ref.as_deref().is_some_and(|r| {
+                root.get("rootRef").and_then(Value::as_str) == Some(r)
+                    || root.get("windowRef").and_then(Value::as_str) == Some(r)
+            }) || window_id
+                .is_some_and(|id| root.get("windowId").and_then(Value::as_i64) == Some(id))
+        })
+        .map(|(id, root)| (id.clone(), root.clone()))
+        .ok_or_else(|| ProtocolError::new("Root not found", ErrorCode::TargetNotFound))?;
+
+    let root_ref = root
+        .get("rootRef")
+        .and_then(Value::as_str)
+        .unwrap_or(&identity)
+        .to_owned();
+    let frame = root
+        .get("framePoints")
+        .cloned()
+        .unwrap_or_else(|| json!({"x":0,"y":0,"w":1,"h":1}));
+    let fx = number_at(&frame, "x", 0.0);
+    let fy = number_at(&frame, "y", 0.0);
+    let fw = number_at(&frame, "w", number_at(&frame, "width", 1.0)).max(1.0);
+    let fh = number_at(&frame, "h", number_at(&frame, "height", 1.0)).max(1.0);
+
+    let wref = windows_bridge::refs::WindowRef::parse(&root_ref)
+        .ok_or_else(|| invalid(format!("Invalid root ref '{root_ref}'")))?;
+    let shot = capture_fast::screenshot_fast(&mut store, &wref, max_dimension)?;
+
+    let mut write_ms = 0u64;
+    if let Some(path) = save_path.as_deref() {
+        let write_started = Instant::now();
+        std::fs::write(path, &shot.png).map_err(|error| {
+            ProtocolError::new(
+                format!("Failed to write screenshot to '{path}': {error}"),
+                ErrorCode::InternalError,
+            )
+        })?;
+        write_ms = write_started.elapsed().as_millis() as u64;
+    }
+
+    let base64_started = Instant::now();
+    let image_payload = if include_base64 {
+        Some(json!({
+            "jpegBase64": BASE64.encode(&shot.png),
+            "mimeType": "image/png",
+            "width": shot.width,
+            "height": shot.height
+        }))
+    } else {
+        None
+    };
+    let base64_ms = base64_started.elapsed().as_millis() as u64;
+
+    let root_hwnd = root.get("windowId").and_then(Value::as_i64).unwrap_or(0) as isize;
+    let look_id = fresh_look_id()?;
+    store_look_record(
+        look_id.clone(),
+        LookRecord {
+            pid: root.get("pid").and_then(Value::as_u64).unwrap_or(0),
+            hwnd: root_hwnd,
+            frame_x: fx,
+            frame_y: fy,
+            frame_w: fw,
+            frame_h: fh,
+            image_w: shot.width as f64,
+            image_h: shot.height as f64,
+            has_image: true,
+            elements: HashMap::new(),
+        },
+    )?;
+
+    let mut response = capture_fast::response_json(&shot, save_path.as_deref());
+    response["lookId"] = json!(look_id);
+    response["timings"]["writeMs"] = json!(write_ms);
+    response["timings"]["base64Ms"] = json!(base64_ms);
+    response["timings"]["totalMs"] = json!(started_at.elapsed().as_millis() as u64);
+    if let Some(payload) = image_payload {
+        response["image"] = payload;
     }
     Ok(response)
 }
