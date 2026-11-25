@@ -1204,8 +1204,12 @@ fn future_dispatch_loop() {
         // input event is injected. A key/button hold continues in its own
         // worker, allowing later scheduled moves/keys to overlap the hold.
         let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let started_fallback = started_tx.clone();
         thread::spawn(move || {
             let result = handle_act_inner(&job.act, true, Some(started_tx));
+            // Wake the dispatcher if the act failed before reaching its first
+            // input event (for example, the observed window was closed).
+            let _ = started_fallback.try_send(());
             if let Ok(mut tasks) = future_tasks().lock() {
                 if let Some(task) = tasks.get_mut(&task_id) {
                     task.finished_at_ms = Some(now_ms());
