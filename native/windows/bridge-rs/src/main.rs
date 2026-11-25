@@ -64,6 +64,18 @@ fn now_ms() -> u128 {
         .unwrap_or_default().as_millis()
 }
 
+/// Serialises the schedule API with the legacy act path, so a hold cannot be
+/// created while a synchronous act is injecting.
+fn future_api_gate() -> &'static Mutex<()> {
+    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+    GATE.get_or_init(|| Mutex::new(()))
+}
+
+fn next_future_task_id() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("gui-task-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
 /// The one input table plus the one thread that reconciles it with the desktop.
 fn scheduler_state() -> &'static Mutex<scheduler::Scheduler> {
     static SCHEDULER: OnceLock<Mutex<scheduler::Scheduler>> = OnceLock::new();
