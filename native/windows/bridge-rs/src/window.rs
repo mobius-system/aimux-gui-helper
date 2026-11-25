@@ -592,6 +592,43 @@ pub fn ensure_foreground(hwnd: isize) -> Result<(), ProtocolError> {
     }
 }
 
+/// Require the target to remain foreground without changing user focus.
+pub fn require_foreground(hwnd: isize) -> Result<(), ProtocolError> {
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        Err(ProtocolError::new("Window focus is only supported on Windows", ErrorCode::UnsupportedPlatform))
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+        let target = windows::Win32::Foundation::HWND(hwnd as *mut _);
+        if unsafe { GetForegroundWindow() } == target {
+            Ok(())
+        } else {
+            Err(ProtocolError::new("Target window is no longer foreground; scheduled input was not sent", ErrorCode::TargetNotFound))
+        }
+    }
+}
+
+/// Read the outer bounds of a window for validating a scheduled look target.
+pub fn window_rect(hwnd: isize) -> Result<(i32, i32, i32, i32), ProtocolError> {
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        Err(ProtocolError::new("Window geometry is only supported on Windows", ErrorCode::UnsupportedPlatform))
+    }
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(windows::Win32::Foundation::HWND(hwnd as *mut _), &mut rect) }
+            .map_err(|_| ProtocolError::new("Scheduled look window no longer exists", ErrorCode::StaleLook))?;
+        Ok((rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

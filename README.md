@@ -49,7 +49,7 @@ scripts/publish-helper.sh     upload the binary + update the helper manifest
 - **`keepPressdownMs` on keypress** (`input.rs` `send_keys`) — a scan code alone
   is not enough for per-frame input pollers: releasing inside the same
   `SendInput` batch leaves the key down for under a millisecond, so no sampled
-  frame ever sees it. Callers can hold the key down for N ms (capped at 5000,
+  frame ever sees it. Callers can hold the key down for N ms (capped at 10000,
   default 0).
 - **Stale call sites in the capture tests** (`capture.rs`) — two Windows-only
   tests still called `screenshot(...)` with three arguments after upstream added
@@ -62,20 +62,23 @@ scripts/publish-helper.sh     upload the binary + update the helper manifest
   `look` would have shown. Video is H.264 and audio is AAC, muxed by the Media
   Foundation sink writer that ships with Windows, so nothing is downloaded and
   no FFmpeg is involved.
+- **Future GUI input scheduling** (`main.rs`, `input.rs`) — `scheduleFuture` accepts an act immediately and returns a task id; status and queued cancellation use the same command. Each accepted task retains its look snapshot. While a scheduled task is pending/running, synchronous `act` / `actBatch` are rejected, so input from one client stays on one timeline. A running key/mouse hold releases before terminal status and is capped at 10000 ms.
 - **`maxDimension` on recordings** (`record.rs`) — a caller can cap the longest
   side of the video and let the helper fit the window into it (`scaled_size` +
   a box-filtered `downscale_bgra`), which is how a recording stays small
   without the caller working out a bitrate. Protocol 5 → 6, because a protocol-5
   helper would silently ignore the field and hand back a video at the wrong
-  size.
+  size. Future scheduling adds the `scheduleFuture` command under protocol 6;
+  an older helper responds with `UnsupportedCommand` instead of silently
+  claiming that the task was accepted.
 
 ## Protocol
 
-Protocol version **6**. Envelope:
+Protocol version **7**. Envelope:
 
 ```json
-{"protocolVersion": 6, "id": "m1728000000000", "cmd": "look", "args": {"rootRef": "@w1"}}
-{"protocolVersion": 6, "id": "m1728000000000", "ok": true, "result": {...}}
+{"protocolVersion": 7, "id": "m1728000000000", "cmd": "look", "args": {"rootRef": "@w1"}}
+{"protocolVersion": 7, "id": "m1728000000000", "ok": true, "result": {...}}
 ```
 
 A request whose `protocolVersion` does not match is rejected; clients treat the
@@ -84,7 +87,7 @@ mismatch as "helper needs reinstalling" rather than as a bad request.
 Commands: `diagnostics`, `listRoots` (alias `listWindows`), `look` (alias
 `screenshot`), `focusWindow`, `act`, `actBatch`, `uiaReadText` (alias
 `axReadText`), `uiaWaitFor` (alias `axWaitFor`), `openBrowserLocation`,
-`recordStart`, `recordStop`, `recordStatus`. Unknown commands return
+`recordStart`, `recordStop`, `recordStatus`, `scheduleFuture`. Unknown commands return
 `UnsupportedCommand`.
 
 `look` returns a `lookId` that `act` resolves refs and image coordinates

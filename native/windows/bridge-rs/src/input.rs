@@ -102,6 +102,15 @@ pub fn open_browser_location(url: &str) -> Result<(), ProtocolError> {
 }
 
 pub fn act(args: &Value) -> Result<Value, ProtocolError> {
+    act_with_started(args, || {})
+}
+
+/// Execute an action and signal once its first input has been injected. The
+/// scheduler uses this edge to start later due events while a hold is active.
+pub fn act_with_started<F>(args: &Value, started: F) -> Result<Value, ProtocolError>
+where
+    F: FnOnce() + Send + 'static,
+{
     let request = parse_act_request(args)?;
     let grounding = args
         .get("resolvedPoint")
@@ -110,7 +119,7 @@ pub fn act(args: &Value) -> Result<Value, ProtocolError> {
 
     if matches!(
         request.action.as_str(),
-        "typeText" | "keypress" | "drag" | "moveMouse"
+        "typeText" | "keypress" | "mousePress" | "drag" | "moveMouse"
     ) {
         policy_allows_raw_input(&request)?;
     }
@@ -120,6 +129,7 @@ pub fn act(args: &Value) -> Result<Value, ProtocolError> {
 
     #[cfg(not(windows))]
     {
+        started();
         Ok(json!({
             "outcome": "unknown",
             "performed": { "grounding": grounding, "delivery": if grounding == "description" { "ax" } else { "hid" } },
@@ -129,7 +139,7 @@ pub fn act(args: &Value) -> Result<Value, ProtocolError> {
 
     #[cfg(windows)]
     {
-        native::act(&request, args, grounding)
+        native::act(&request, args, grounding, Some(Box::new(started)))
     }
 }
 
@@ -146,7 +156,7 @@ mod native {
     use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
     /// Upper bound for `keepPressdownMs`, so a caller cannot wedge a key down.
-    const MAX_PRESSDOWN_MS: u64 = 5000;
+    const MAX_PRESSDOWN_MS: u64 = 10000;
 
     pub fn open_browser_location(url: &str) -> Result<(), ProtocolError> {
         hotkey(&[VK_CONTROL], VK_L)?;
@@ -158,6 +168,7 @@ mod native {
         request: &ParsedActRequest,
         args: &Value,
         grounding: &str,
+        started: &mut Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<Value, ProtocolError> {
         let point = args.get("resolvedPoint").and_then(point_value);
         match request.action.as_str() {
@@ -172,11 +183,13 @@ mod native {
                         .and_then(Value::as_str)
                         .unwrap_or("left"),
                 )?;
+                notify_started(started);
                 ok("unknown", grounding, "hid")
             }
             "moveMouse" => {
                 let (x, y) = point.ok_or_else(|| invalid("moveMouse requires resolvedPoint"))?;
                 unsafe { SetCursorPos(x, y) }.map_err(input_failed)?;
+                notify_started(started);
                 ok("unknown", "coordinates", "hid")
             }
             "drag" => {
@@ -189,6 +202,7 @@ mod native {
                     .map(point_value_required)
                     .collect::<Result<Vec<_>, _>>()?;
                 drag(&points)?;
+                notify_started(started);
                 ok("unknown", "coordinates", "hid")
             }
             "scroll" => {
@@ -204,6 +218,7 @@ mod native {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
                 scroll(x, y, dx, dy)?;
+                notify_started(started);
                 ok("unknown", grounding, "hid")
             }
             "typeText" => {
@@ -214,6 +229,7 @@ mod native {
                         .and_then(Value::as_str)
                         .unwrap_or(""),
                 )?;
+                notify_started(started);
                 ok("unknown", "coordinates", "hid")
             }
             "setText" => {
@@ -227,6 +243,7 @@ mod native {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 send_text(text)?;
+                notify_started(started);
                 Ok(
                     json!({ "outcome": "unknown", "performed": { "grounding": grounding, "delivery": "hid" }, "evidence": { "value": text } }),
                 )
@@ -247,15 +264,42 @@ mod native {
                     .get("keepPressdownMs")
                     .and_then(Value::as_u64)
                     .unwrap_or(0)
-                    .min(MAX_PRESSDOWN_MS);
-                send_keys(keys, hold_ms)?;
+                    ;
+                if hold_ms > MAX_PRESSDOWN_MS {
+                    return Err(invalid("keepPressdownMs must be at most 10000"));
+                }
+                send_keys(keys, hold_ms, started)?;
                 ok("unknown", "coordinates", "hid")
+            }
+            "mousePress" => {
+                let button = request.params.get("button").and_then(Value::as_str).unwrap_or("left");
+                let hold_ms = request.params.get("keepPressdownMs").and_then(Value::as_u64).unwrap_or(100);
+                if hold_ms == 0 || hold_ms > 10_000 {
+                    return Err(invalid("mousePress keepPressdownMs must be between 1 and 10000"));
+                }
+                let (down, up) = mouse_button_flags(button)?;
+                let (x, y) = point.ok_or_else(|| invalid("mousePress requires resolvedPoint"))?;
+                unsafe { SetCursorPos(x, y) }.map_err(input_failed)?;
+                let started_at = std::time::Instant::now();
+                if let Err(error) = send(&[mouse(down, 0)]) {
+                    let release = send(&[mouse(up, 0)]).is_ok();
+                    return Ok(json!({"outcome":"didnt","performed":{"grounding":"coordinates","delivery":"hid"},"button":button,"buttonDownSent":false,"buttonReleaseSent":release,"requestedDurationMs":hold_ms,"actualDurationMs":0,"error":error.to_string()}));
+                }
+                notify_started(started);
+                sleep(Duration::from_millis(hold_ms));
+                let release = send(&[mouse(up, 0)]);
+                let actual = started_at.elapsed().as_millis() as u64;
+                Ok(json!({"outcome":if release.is_ok() { "unknown" } else { "didnt" },"performed":{"grounding":"coordinates","delivery":"hid"},"button":button,"buttonDownSent":true,"buttonReleaseSent":release.is_ok(),"requestedDurationMs":hold_ms,"actualDurationMs":actual,"releaseError":release.err().map(|error| error.to_string())}))
             }
             other => Err(ProtocolError::new(
                 format!("Unsupported Windows action '{other}'"),
                 ErrorCode::UnsupportedCommand,
             )),
         }
+    }
+
+    fn notify_started(started: &mut Option<Box<dyn FnOnce() + Send>>) {
+        if let Some(callback) = started.take() { callback(); }
     }
 
     fn ok(outcome: &str, grounding: &str, delivery: &str) -> Result<Value, ProtocolError> {
@@ -301,6 +345,15 @@ mod native {
                     ..Default::default()
                 },
             },
+        }
+    }
+
+    fn mouse_button_flags(button: &str) -> Result<(MOUSE_EVENT_FLAGS, MOUSE_EVENT_FLAGS), ProtocolError> {
+        match button {
+            "left" => Ok((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP)),
+            "right" => Ok((MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP)),
+            "middle" => Ok((MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP)),
+            other => Err(invalid(format!("Unsupported mouse button '{other}' (choose left, right, middle)"))),
         }
     }
 
@@ -408,7 +461,7 @@ mod native {
         send(&inputs)
     }
 
-    fn send_keys(keys: &[Value], hold_ms: u64) -> Result<(), ProtocolError> {
+    fn send_keys(keys: &[Value], hold_ms: u64, started: &mut Option<Box<dyn FnOnce() + Send>>) -> Result<(), ProtocolError> {
         let names = keys.iter().filter_map(Value::as_str).collect::<Vec<_>>();
         if names.is_empty() {
             return Err(invalid("keypress requires at least one key"));
@@ -417,19 +470,22 @@ mod native {
             .iter()
             .map(|name| vk_for(name).ok_or_else(|| invalid(format!("Unsupported key '{name}'"))))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut primary_error = None;
         for vk in &vks[..vks.len().saturating_sub(1)] {
-            send(&[key(*vk, false)])?;
+            if let Err(error) = send(&[key(*vk, false)]) { primary_error = Some(error); break; }
         }
-        if let Some(last) = vks.last() {
-            send(&[key(*last, false)])?;
-            if hold_ms > 0 {
-                sleep(Duration::from_millis(hold_ms));
+        if primary_error.is_none() {
+            if let Some(last) = vks.last() {
+                if let Err(error) = send(&[key(*last, false)]) { primary_error = Some(error); }
+                else { notify_started(started); if hold_ms > 0 { sleep(Duration::from_millis(hold_ms)); } }
             }
-            send(&[key(*last, true)])?;
         }
-        for vk in vks[..vks.len().saturating_sub(1)].iter().rev() {
-            send(&[key(*vk, true)])?;
+        let mut release_error = None;
+        for vk in vks.iter().rev() {
+            if let Err(error) = send(&[key(*vk, true)]) { if release_error.is_none() { release_error = Some(error); } }
         }
+        if let Some(error) = primary_error { return Err(error); }
+        if let Some(error) = release_error { return Err(error); }
         Ok(())
     }
 
