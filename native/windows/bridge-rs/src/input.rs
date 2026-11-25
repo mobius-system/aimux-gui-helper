@@ -139,7 +139,8 @@ where
 
     #[cfg(windows)]
     {
-        native::act(&request, args, grounding, Some(Box::new(started)))
+        let mut started: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(started));
+        native::act(&request, args, grounding, &mut started)
     }
 }
 
