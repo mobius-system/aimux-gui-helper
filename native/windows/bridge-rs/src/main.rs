@@ -1,15 +1,15 @@
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
-use std::sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 use windows_bridge::{
-    capture, capture_fast, input, protocol::PROTOCOL_VERSION, record, refs::RefStore, window,
-    ErrorCode, ProtocolError, Request, Response,
+    capture, capture_fast, input, protocol::PROTOCOL_VERSION, record, refs::RefStore, scheduler,
+    window, ErrorCode, ProtocolError, Request, Response,
 };
 
 #[derive(Clone, Debug)]
@@ -59,65 +59,70 @@ struct HelperState {
 const MAX_LOOK_RECORDS: usize = 8;
 const REQUEST_WORKERS: usize = 8;
 
-#[derive(Clone)]
-struct FutureTask {
-    state: String,
-    submitted_at_ms: u128,
-    scheduled_at_ms: u128,
-    started_at_ms: Option<u128>,
-    finished_at_ms: Option<u128>,
-    result: Option<Value>,
-    error: Option<String>,
-}
-
-struct ScheduledJob {
-    task_id: String,
-    due: Instant,
-    sequence: u64,
-    act: Value,
-    look: LookRecord,
-    look_id: String,
-}
-
-fn future_tasks() -> &'static Mutex<HashMap<String, FutureTask>> {
-    static TASKS: OnceLock<Mutex<HashMap<String, FutureTask>>> = OnceLock::new();
-    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn future_api_gate() -> &'static Mutex<()> {
-    static GATE: OnceLock<Mutex<()>> = OnceLock::new();
-    GATE.get_or_init(|| Mutex::new(()))
-}
-
-fn scheduled_jobs() -> &'static (Mutex<Vec<ScheduledJob>>, Condvar) {
-    static JOBS: OnceLock<(Mutex<Vec<ScheduledJob>>, Condvar)> = OnceLock::new();
-    JOBS.get_or_init(|| (Mutex::new(Vec::new()), Condvar::new()))
-}
-
-fn ensure_future_dispatcher() {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| { thread::spawn(future_dispatch_loop); });
-}
-
-fn scheduled_job_index(jobs: &[ScheduledJob]) -> Option<usize> {
-    jobs.iter().enumerate().min_by(|(_, a), (_, b)|
-        a.due.cmp(&b.due).then_with(|| a.sequence.cmp(&b.sequence)))
-        .map(|(index, _)| index)
-}
-
-fn next_future_task_id() -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    format!("gui-task-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))
-}
-
-fn next_schedule_sequence() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
-
 fn now_ms() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default().as_millis()
+}
+
+/// The one input table plus the one thread that reconciles it with the desktop.
+fn scheduler_state() -> &'static Mutex<scheduler::Scheduler> {
+    static SCHEDULER: OnceLock<Mutex<scheduler::Scheduler>> = OnceLock::new();
+    SCHEDULER.get_or_init(|| Mutex::new(scheduler::Scheduler::new(Instant::now())))
+}
+
+fn ensure_scheduler() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        thread::spawn(scheduler_loop);
+    });
+}
+
+struct Win32Injector;
+
+impl scheduler::Injector for Win32Injector {
+    fn press(&mut self, actuator: scheduler::Actuator) -> Result<(), String> {
+        input::inject_actuator(actuator, true).map_err(|error| error.to_string())
+    }
+
+    fn release(&mut self, actuator: scheduler::Actuator) -> Result<(), String> {
+        input::inject_actuator(actuator, false).map_err(|error| error.to_string())
+    }
+
+    fn point(&mut self, action: &scheduler::PointAction) -> Result<(), String> {
+        input::inject_point(action).map_err(|error| error.to_string())
+    }
+}
+
+fn scheduler_active() -> bool {
+    scheduler_state().lock().map(|scheduler| scheduler.active()).unwrap_or(true)
+}
+
+fn scheduler_loop() {
+    #[cfg(windows)]
+    raise_timer_resolution();
+    let mut injector = Win32Injector;
+    loop {
+        thread::sleep(scheduler::TICK);
+        let now = Instant::now();
+        let now_ms = now_ms();
+        let Ok(mut scheduler) = scheduler_state().lock() else { return; };
+        let _ = scheduler.tick(now, now_ms, &mut injector);
+    }
+}
+
+/// The default Windows timer granularity is 15.6 ms; the scheduler samples at
+/// 10 ms, so ask for 1 ms. The request is released when the process exits.
+#[cfg(windows)]
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+}
+
+#[cfg(windows)]
+fn raise_timer_resolution() {
+    unsafe {
+        timeBeginPeriod(1);
+    }
 }
 
 impl Default for HelperState {
@@ -976,17 +981,10 @@ fn scoped_outline_root(mut outline: Value, scope_ref: &str) -> Value {
 }
 
 fn handle_act(args: &Value) -> Result<Value, ProtocolError> {
-    handle_act_inner(args, false, None)
-}
-
-fn handle_act_inner(args: &Value, scheduled: bool, start_notify: Option<mpsc::SyncSender<()>>) -> Result<Value, ProtocolError> {
-    let _api_guard = if scheduled { None } else { Some(future_api_gate().lock().map_err(|_| internal("future API gate poisoned"))?) };
+    let _api_guard = future_api_gate().lock().map_err(|_| internal("future API gate poisoned"))?;
     let parsed = input::parse_act_request(args)?;
-    if !scheduled && future_tasks_active() {
+    if scheduler_active() {
         return Err(invalid("remote_gui_act is mutually exclusive with pending/running remote_gui_act_schedule_future tasks; schedule all input through the future API until those tasks finish"));
-    }
-    if scheduled && !matches!(&parsed.target, input::ActTarget::Point { .. }) {
-        return Err(invalid("scheduled actions must use x/y coordinates from their bound look_id"));
     }
     let record = {
         let state = helper_state()
@@ -1040,16 +1038,7 @@ fn handle_act_inner(args: &Value, scheduled: bool, start_notify: Option<mpsc::Sy
                     );
                 }
             }
-            let notify = start_notify.clone();
             let perform = move || {
-                if scheduled {
-                    let current = window::window_rect(record.hwnd)?;
-                    let observed = (record.frame_x.round() as i32, record.frame_y.round() as i32,
-                        record.frame_w.round() as i32, record.frame_h.round() as i32);
-                    if current != observed {
-                        return Err(ProtocolError::new("The target window moved or resized after look_id was captured; scheduled input was not sent", ErrorCode::StaleLook));
-                    }
-                }
                 let preserve_focus = parsed
                     .params
                     .get("preserveFocus")
@@ -1060,13 +1049,9 @@ fn handle_act_inner(args: &Value, scheduled: bool, start_notify: Option<mpsc::Sy
                 } else {
                     window::ensure_foreground(record.hwnd)?;
                 }
-                if scheduled {
-                    input::act_with_started(&executable, move || {
-                        if let Some(sender) = notify { let _ = sender.send(()); }
-                    })
-                } else { input::act(&executable) }
+                input::act(&executable)
             };
-            if scheduled { perform()? } else { with_physical_input(perform)? }
+            with_physical_input(perform)?
         }
     };
 
@@ -1081,160 +1066,215 @@ fn handle_act_inner(args: &Value, scheduled: bool, start_notify: Option<mpsc::Sy
     Ok(response)
 }
 
-fn future_tasks_active() -> bool {
-    future_tasks().lock().map(|tasks| tasks.values().any(|task| task.state == "scheduled" || task.state == "running")).unwrap_or(true)
-}
-
 fn handle_schedule_future(args: &Value) -> Result<Value, ProtocolError> {
     let operation = args.get("operation").and_then(Value::as_str).unwrap_or("schedule");
-    let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
     match operation {
         "status" => {
-            let tasks = future_tasks().lock().map_err(|_| internal("future task lock poisoned"))?;
-            let task = tasks.get(task_id).ok_or_else(|| invalid("unknown task_id"))?;
-            Ok(future_task_json(task_id, task))
+            let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
+            let table = scheduler_state().lock().map_err(|_| internal("scheduler lock poisoned"))?;
+            let task = table.status(task_id).ok_or_else(|| invalid("unknown task_id"))?;
+            Ok(task_json(task_id, task))
         }
         "cancel" => {
-            let mut tasks = future_tasks().lock().map_err(|_| internal("future task lock poisoned"))?;
-            let task = tasks.get_mut(task_id).ok_or_else(|| invalid("unknown task_id"))?;
-            if task.state == "scheduled" {
-                task.state = "cancelled".to_owned();
-                task.finished_at_ms = Some(now_ms());
-                Ok(json!({"taskId": task_id, "cancelled": true, "state": task.state}))
-            } else {
-                Ok(json!({"taskId": task_id, "cancelled": false, "state": task.state, "reason": "only scheduled tasks can be cancelled; running input is allowed to finish and release"}))
-            }
+            let task_id = args.get("taskId").and_then(Value::as_str).unwrap_or("");
+            let now = Instant::now();
+            let now_ms = now_ms();
+            let mut table = scheduler_state().lock().map_err(|_| internal("scheduler lock poisoned"))?;
+            let previous = table
+                .cancel(task_id, now, now_ms)
+                .ok_or_else(|| invalid("unknown task_id"))?;
+            let cancelled = matches!(previous, scheduler::Phase::Scheduled | scheduler::Phase::Running);
+            let state = table
+                .status(task_id)
+                .map(|task| task.phase.as_str())
+                .unwrap_or("cancelled");
+            Ok(json!({
+                "taskId": task_id,
+                "cancelled": cancelled,
+                "state": state,
+                "reason": if cancelled { Value::Null } else { json!("only scheduled or running tasks can be cancelled") },
+            }))
         }
-        "schedule" => {
-            let _api_guard = future_api_gate().lock().map_err(|_| internal("future API gate poisoned"))?;
-            let delay = args.get("scheduleAfterMs").and_then(Value::as_u64).unwrap_or(0);
-            if delay > 60_000 { return Err(invalid("schedule_after_ms must be between 0 and 60000")); }
-            let act = args.get("act").filter(|v| v.is_object()).ok_or_else(|| invalid("schedule operation requires act object"))?;
-            let parsed = input::parse_act_request(act)?;
-            if parsed.policy != "foreground" { return Err(invalid("scheduled raw input requires policy=foreground")); }
-            if !matches!(&parsed.target, input::ActTarget::Point { .. }) { return Err(invalid("scheduled actions require x/y coordinates")); }
-            if !matches!(parsed.action.as_str(), "keypress" | "mousePress" | "moveMouse" | "click" | "drag") {
-                return Err(invalid("scheduled action must be keypress, mousePress, moveMouse, click, or drag"));
-            }
-            if parsed.action == "keypress" {
-                let keys = parsed.params.get("keys").and_then(Value::as_array).filter(|v| !v.is_empty()).ok_or_else(|| invalid("scheduled keypress requires keys"))?;
-                let _ = keys;
-            }
-            if matches!(parsed.action.as_str(), "keypress" | "mousePress") {
-                let hold = parsed.params.get("keepPressdownMs").and_then(Value::as_u64).unwrap_or(100);
-                if hold == 0 || hold > 10_000 { return Err(invalid("keep_pressdown_ms must be between 1 and 10000")); }
-            }
-            if parsed.action == "mousePress" {
-                let button = parsed.params.get("button").and_then(Value::as_str).unwrap_or("left");
-                if !matches!(button, "left" | "right" | "middle") { return Err(invalid("button must be left, right, or middle")); }
-            }
-            let look = {
-                let state = helper_state().lock().map_err(|_| internal("helper state lock poisoned"))?;
-                state.looks.get(&parsed.look_id).cloned().ok_or_else(|| ProtocolError::new("look_id is stale; schedule from a fresh remote_gui_look", ErrorCode::StaleLook))?
-            };
-            let id = next_future_task_id();
-            let submitted = now_ms();
-            let entry = FutureTask { state: "scheduled".into(), submitted_at_ms: submitted, scheduled_at_ms: submitted + delay as u128, started_at_ms: None, finished_at_ms: None, result: None, error: None };
-            {
-                let mut tasks = future_tasks().lock().map_err(|_| internal("future task lock poisoned"))?;
-                if tasks.len() >= 256 {
-                    if let Some(oldest) = tasks.iter().filter(|(_, t)| t.state == "completed" || t.state == "failed" || t.state == "cancelled").min_by_key(|(_, t)| t.submitted_at_ms).map(|(id, _)| id.clone()) { tasks.remove(&oldest); }
-                    if tasks.len() >= 256 { return Err(invalid("future task limit reached (256 active/recent entries)")); }
-                }
-                tasks.insert(id.clone(), entry);
-            }
-            let sequence = next_schedule_sequence();
-            let (queue, wake) = scheduled_jobs();
-            queue.lock().map_err(|_| internal("scheduled queue poisoned"))?.push(ScheduledJob {
-                task_id: id.clone(), due: Instant::now() + Duration::from_millis(delay), sequence,
-                act: act.clone(), look, look_id: parsed.look_id.clone(),
-            });
-            ensure_future_dispatcher();
-            wake.notify_one();
-            Ok(json!({"taskId": id, "state": "scheduled", "submittedAtMs": submitted, "scheduledAtMs": submitted + delay as u128, "scheduleAfterMs": delay}))
-        }
+        "schedule" => schedule_one(args),
         _ => Err(invalid("operation must be schedule, status, or cancel")),
     }
 }
 
-fn future_task_json(task_id: &str, task: &FutureTask) -> Value {
-    json!({"taskId": task_id, "state": task.state, "submittedAtMs": task.submitted_at_ms, "scheduledAtMs": task.scheduled_at_ms, "startedAtMs": task.started_at_ms, "finishedAtMs": task.finished_at_ms, "result": task.result, "error": task.error})
+fn task_json(task_id: &str, task: &scheduler::Task) -> Value {
+    json!({
+        "taskId": task_id,
+        "state": task.phase.as_str(),
+        "submittedAtMs": task.submitted_ms,
+        "scheduledAtMs": task.scheduled_ms,
+        "startedAtMs": task.started_ms,
+        "finishedAtMs": task.finished_ms,
+        "result": if task.phase == scheduler::Phase::Completed {
+            json!({ "outcome": "unknown", "performed": { "grounding": "coordinates", "delivery": "hid" } })
+        } else {
+            Value::Null
+        },
+        "error": task.error,
+    })
 }
 
-fn future_dispatch_loop() {
-    loop {
-        let job = {
-            let (queue, wake) = scheduled_jobs();
-            let Ok(mut jobs) = queue.lock() else { return; };
-            loop {
-                if jobs.is_empty() {
-                    let Ok(next) = wake.wait(jobs) else { return; };
-                    jobs = next;
-                    continue;
-                }
-                let Some(next_index) = scheduled_job_index(&jobs) else { continue; };
-                let remaining = jobs[next_index].due.saturating_duration_since(Instant::now());
-                if !remaining.is_zero() {
-                    let Ok((next, _)) = wake.wait_timeout(jobs, remaining) else { return; };
-                    jobs = next;
-                    continue;
-                }
-                break jobs.remove(next_index);
-            }
-        };
-
-        let task_id = job.task_id.clone();
-        let should_run = if let Ok(mut tasks) = future_tasks().lock() {
-            if let Some(task) = tasks.get_mut(&task_id) {
-                if task.state == "scheduled" {
-                    task.state = "running".into();
-                    task.started_at_ms = Some(now_ms());
-                    true
-                } else { false }
-            } else { false }
-        } else { false };
-        if !should_run { continue; }
-
-        if let Ok(mut state) = helper_state().lock() {
-            state.looks.insert(job.look_id.clone(), job.look);
-            if !state.look_order.contains(&job.look_id) { state.look_order.push_back(job.look_id.clone()); }
-        }
-
-        // Start actions in their due-time order, but wait only until the first
-        // input event is injected. A key/button hold continues in its own
-        // worker, allowing later scheduled moves/keys to overlap the hold.
-        let (started_tx, started_rx) = mpsc::sync_channel(1);
-        let started_fallback = started_tx.clone();
-        thread::spawn(move || {
-            let result = handle_act_inner(&job.act, true, Some(started_tx));
-            // Wake the dispatcher if the act failed before reaching its first
-            // input event (for example, the observed window was closed).
-            let _ = started_fallback.try_send(());
-            if let Ok(mut tasks) = future_tasks().lock() {
-                if let Some(task) = tasks.get_mut(&task_id) {
-                    task.finished_at_ms = Some(now_ms());
-                    match result {
-                        Ok(value) => {
-                            let action_failed = value.get("outcome").and_then(Value::as_str) == Some("didnt")
-                                || value.get("buttonReleaseSent").and_then(Value::as_bool) == Some(false);
-                            if action_failed {
-                                task.state = "failed".into();
-                                task.error = Some(value.get("releaseError").or_else(|| value.get("error")).and_then(Value::as_str).unwrap_or("scheduled act reported failure").to_owned());
-                            } else { task.state = "completed".into(); }
-                            task.result = Some(value);
-                        },
-                        Err(error) => { task.state = "failed".into(); task.error = Some(error.to_string()); }
-                    }
-                }
-            }
-        });
-        let _ = started_rx.recv();
+fn hold_param(request: &input::ParsedActRequest, default_ms: u64) -> Result<u64, ProtocolError> {
+    let hold = request
+        .params
+        .get("keepPressdownMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(default_ms);
+    if hold < scheduler::MIN_HOLD_MS {
+        return Err(invalid(format!(
+            "keepPressdownMs must be at least {} (got {hold})",
+            scheduler::MIN_HOLD_MS
+        )));
     }
+    if hold > scheduler::MAX_HOLD_MS {
+        return Err(invalid(format!(
+            "keepPressdownMs must be at most {} (got {hold})",
+            scheduler::MAX_HOLD_MS
+        )));
+    }
+    Ok(hold)
+}
+
+fn schedule_one(args: &Value) -> Result<Value, ProtocolError> {
+    let _api_guard = future_api_gate().lock().map_err(|_| internal("future API gate poisoned"))?;
+    let delay_ms = args.get("scheduleAfterMs").and_then(Value::as_u64).unwrap_or(0);
+    if delay_ms > scheduler::MAX_DELAY_MS {
+        return Err(invalid("schedule_after_ms must be between 0 and 60000"));
+    }
+    let act = args
+        .get("act")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| invalid("schedule operation requires act object"))?;
+    let request = input::parse_act_request(act)?;
+    if request.policy != "foreground" {
+        return Err(invalid("scheduled input requires policy=foreground"));
+    }
+    let (x, y) = match &request.target {
+        input::ActTarget::Point { x, y } => (*x, *y),
+        input::ActTarget::Ref(_) => {
+            return Err(invalid("scheduled actions require x/y coordinates"));
+        }
+    };
+    let record = {
+        let state = helper_state().lock().map_err(|_| internal("helper state lock poisoned"))?;
+        state.looks.get(&request.look_id).cloned().ok_or_else(|| {
+            ProtocolError::new(
+                "look_id is stale; schedule from a fresh remote_gui_look",
+                ErrorCode::StaleLook,
+            )
+        })?
+    };
+    if !record.has_image {
+        return Err(ProtocolError::new(
+            "Coordinate targeting is unavailable for this outline-only root",
+            ErrorCode::CoordinateUnavailableForRoot,
+        ));
+    }
+    let point = screen_point(&record, x, y);
+    let screen_x = point.get("x").and_then(Value::as_f64).unwrap_or(0.0).round() as i32;
+    let screen_y = point.get("y").and_then(Value::as_f64).unwrap_or(0.0).round() as i32;
+
+    let task_id = next_future_task_id();
+    let now = Instant::now();
+    let submitted_ms = now_ms();
+    let delay = Duration::from_millis(delay_ms);
+    let scheduled_ms = submitted_ms + delay_ms as u128;
+    let mut table = scheduler_state().lock().map_err(|_| internal("scheduler lock poisoned"))?;
+
+    let (action, hold_ms) = match request.action.as_str() {
+        "keypress" => {
+            let names: Vec<&str> = request
+                .params
+                .get("keys")
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if names.is_empty() {
+                return Err(invalid("keypress requires a non-empty keys array"));
+            }
+            let mut actuators: Vec<(scheduler::Actuator, u32)> = Vec::new();
+            for (order, name) in names.iter().enumerate() {
+                let vk = input::virtual_key(name)
+                    .ok_or_else(|| invalid(format!("Unsupported key '{name}'")))?;
+                let actuator = scheduler::Actuator::Key(vk);
+                if !actuators.iter().any(|(existing, _)| *existing == actuator) {
+                    actuators.push((actuator, order as u32));
+                }
+            }
+            let hold = hold_param(&request, 100)?;
+            table
+                .submit_hold(&task_id, now, submitted_ms, delay, Duration::from_millis(hold), actuators)
+                .map_err(invalid)?;
+            ("keypress", hold)
+        }
+        "mousePress" => {
+            let name = request.params.get("button").and_then(Value::as_str).unwrap_or("left");
+            let button = scheduler::Button::parse(name)
+                .ok_or_else(|| invalid(format!("Unsupported mouse button '{name}'")))?;
+            let hold = hold_param(&request, 100)?;
+            table
+                .submit_hold(
+                    &task_id,
+                    now,
+                    submitted_ms,
+                    delay,
+                    Duration::from_millis(hold),
+                    vec![(scheduler::Actuator::Button(button), 0)],
+                )
+                .map_err(invalid)?;
+            ("mousePress", hold)
+        }
+        "moveMouse" => {
+            table
+                .submit_point(
+                    &task_id,
+                    now,
+                    submitted_ms,
+                    delay,
+                    scheduler::PointAction::Move { x: screen_x, y: screen_y },
+                )
+                .map_err(invalid)?;
+            ("moveMouse", 0)
+        }
+        "scroll" => {
+            let dx = request.params.get("scrollX").and_then(Value::as_f64).unwrap_or(0.0);
+            let dy = request.params.get("scrollY").and_then(Value::as_f64).unwrap_or(0.0);
+            table
+                .submit_point(
+                    &task_id,
+                    now,
+                    submitted_ms,
+                    delay,
+                    scheduler::PointAction::Scroll { x: screen_x, y: screen_y, dx, dy },
+                )
+                .map_err(invalid)?;
+            ("scroll", 0)
+        }
+        other => {
+            return Err(invalid(format!(
+                "scheduled action must be keypress, mousePress, moveMouse, or scroll (got '{other}')"
+            )));
+        }
+    };
+    drop(table);
+    ensure_scheduler();
+    Ok(json!({
+        "taskId": task_id,
+        "state": "scheduled",
+        "action": action,
+        "submittedAtMs": submitted_ms,
+        "scheduledAtMs": scheduled_ms,
+        "scheduleAfterMs": delay_ms,
+        "keepPressdownMs": hold_ms,
+    }))
 }
 
 fn handle_act_batch(args: &Value) -> Result<Value, ProtocolError> {
     let _api_guard = future_api_gate().lock().map_err(|_| internal("future API gate poisoned"))?;
-    if future_tasks_active() {
+    if scheduler_active() {
         return Err(invalid("actBatch is mutually exclusive with pending/running remote_gui_act_schedule_future tasks"));
     }
     let actions = args
@@ -2122,17 +2162,4 @@ mod tests {
         assert_eq!(delta[1]["change"], "closed");
     }
 
-    #[test]
-    fn future_dispatch_orders_due_times_then_acceptance_sequence() {
-        let due = Instant::now() + Duration::from_millis(50);
-        let look = || LookRecord {
-            pid: 1, hwnd: 1, frame_x: 0.0, frame_y: 0.0, frame_w: 10.0, frame_h: 10.0,
-            image_w: 10.0, image_h: 10.0, has_image: true, elements: HashMap::new(),
-        };
-        let job = |id: &str, due, sequence| ScheduledJob {
-            task_id: id.into(), due, sequence, act: json!({}), look: look(), look_id: "look".into(),
-        };
-        let jobs = vec![job("later", due + Duration::from_millis(10), 1), job("tie-second", due, 2), job("tie-first", due, 1)];
-        assert_eq!(scheduled_job_index(&jobs), Some(2));
-    }
 }

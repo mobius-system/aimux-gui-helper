@@ -102,15 +102,6 @@ pub fn open_browser_location(url: &str) -> Result<(), ProtocolError> {
 }
 
 pub fn act(args: &Value) -> Result<Value, ProtocolError> {
-    act_with_started(args, || {})
-}
-
-/// Execute an action and signal once its first input has been injected. The
-/// scheduler uses this edge to start later due events while a hold is active.
-pub fn act_with_started<F>(args: &Value, started: F) -> Result<Value, ProtocolError>
-where
-    F: FnOnce() + Send + 'static,
-{
     let request = parse_act_request(args)?;
     let grounding = args
         .get("resolvedPoint")
@@ -129,7 +120,6 @@ where
 
     #[cfg(not(windows))]
     {
-        started();
         Ok(json!({
             "outcome": "unknown",
             "performed": { "grounding": grounding, "delivery": if grounding == "description" { "ax" } else { "hid" } },
@@ -139,8 +129,71 @@ where
 
     #[cfg(windows)]
     {
-        let mut started: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(started));
-        native::act(&request, args, grounding, &mut started)
+        native::act(&request, args, grounding)
+    }
+}
+
+/// Resolve the key names accepted by `keypress` to Windows virtual-key codes.
+///
+/// Kept outside the Win32 module so the scheduled-action parser can validate
+/// names without a desktop session.
+pub fn virtual_key(name: &str) -> Option<u16> {
+    match name.to_ascii_lowercase().as_str() {
+        "enter" | "return" => Some(0x0D),
+        "escape" | "esc" => Some(0x1B),
+        "tab" => Some(0x09),
+        "backspace" => Some(0x08),
+        "delete" => Some(0x2E),
+        "space" => Some(0x20),
+        "left" | "arrowleft" => Some(0x25),
+        "right" | "arrowright" => Some(0x27),
+        "up" | "arrowup" => Some(0x26),
+        "down" | "arrowdown" => Some(0x28),
+        "home" => Some(0x24),
+        "end" => Some(0x23),
+        "pageup" => Some(0x21),
+        "pagedown" => Some(0x22),
+        "ctrl" | "control" => Some(0x11),
+        "shift" => Some(0x10),
+        "alt" | "option" => Some(0x12),
+        "cmd" | "win" | "meta" => Some(0x5B),
+        key if key.len() == 1 => Some(key.as_bytes()[0].to_ascii_uppercase() as u16),
+        key if key.starts_with('f') => key[1..]
+            .parse::<u16>()
+            .ok()
+            .filter(|n| (1..=24).contains(n))
+            .map(|n| 0x70 + n - 1),
+        _ => None,
+    }
+}
+
+/// Press or release one actuator for the scheduler. The scheduler owns the
+/// hold state, so this only injects the edge it asks for.
+pub fn inject_actuator(
+    actuator: crate::scheduler::Actuator,
+    down: bool,
+) -> Result<(), ProtocolError> {
+    #[cfg(not(windows))]
+    {
+        let _ = (actuator, down);
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        native::inject_actuator(actuator, down)
+    }
+}
+
+/// Run one scheduled point event (cursor move or wheel notch).
+pub fn inject_point(action: &crate::scheduler::PointAction) -> Result<(), ProtocolError> {
+    #[cfg(not(windows))]
+    {
+        let _ = action;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        native::inject_point(action)
     }
 }
 
@@ -169,7 +222,6 @@ mod native {
         request: &ParsedActRequest,
         args: &Value,
         grounding: &str,
-        started: &mut Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<Value, ProtocolError> {
         let point = args.get("resolvedPoint").and_then(point_value);
         match request.action.as_str() {
@@ -184,13 +236,11 @@ mod native {
                         .and_then(Value::as_str)
                         .unwrap_or("left"),
                 )?;
-                notify_started(started);
                 ok("unknown", grounding, "hid")
             }
             "moveMouse" => {
                 let (x, y) = point.ok_or_else(|| invalid("moveMouse requires resolvedPoint"))?;
                 unsafe { SetCursorPos(x, y) }.map_err(input_failed)?;
-                notify_started(started);
                 ok("unknown", "coordinates", "hid")
             }
             "drag" => {
@@ -203,7 +253,6 @@ mod native {
                     .map(point_value_required)
                     .collect::<Result<Vec<_>, _>>()?;
                 drag(&points)?;
-                notify_started(started);
                 ok("unknown", "coordinates", "hid")
             }
             "scroll" => {
@@ -219,7 +268,6 @@ mod native {
                     .and_then(Value::as_f64)
                     .unwrap_or(0.0);
                 scroll(x, y, dx, dy)?;
-                notify_started(started);
                 ok("unknown", grounding, "hid")
             }
             "typeText" => {
@@ -230,7 +278,6 @@ mod native {
                         .and_then(Value::as_str)
                         .unwrap_or(""),
                 )?;
-                notify_started(started);
                 ok("unknown", "coordinates", "hid")
             }
             "setText" => {
@@ -244,7 +291,6 @@ mod native {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 send_text(text)?;
-                notify_started(started);
                 Ok(
                     json!({ "outcome": "unknown", "performed": { "grounding": grounding, "delivery": "hid" }, "evidence": { "value": text } }),
                 )
@@ -269,7 +315,7 @@ mod native {
                 if hold_ms > MAX_PRESSDOWN_MS {
                     return Err(invalid("keepPressdownMs must be at most 10000"));
                 }
-                send_keys(keys, hold_ms, started)?;
+                send_keys(keys, hold_ms)?;
                 ok("unknown", "coordinates", "hid")
             }
             "mousePress" => {
@@ -286,7 +332,6 @@ mod native {
                     let release = send(&[mouse(up, 0)]).is_ok();
                     return Ok(json!({"outcome":"didnt","performed":{"grounding":"coordinates","delivery":"hid"},"button":button,"buttonDownSent":false,"buttonReleaseSent":release,"requestedDurationMs":hold_ms,"actualDurationMs":0,"error":error.to_string()}));
                 }
-                notify_started(started);
                 sleep(Duration::from_millis(hold_ms));
                 let release = send(&[mouse(up, 0)]);
                 let actual = started_at.elapsed().as_millis() as u64;
@@ -297,10 +342,6 @@ mod native {
                 ErrorCode::UnsupportedCommand,
             )),
         }
-    }
-
-    fn notify_started(started: &mut Option<Box<dyn FnOnce() + Send>>) {
-        if let Some(callback) = started.take() { callback(); }
     }
 
     fn ok(outcome: &str, grounding: &str, delivery: &str) -> Result<Value, ProtocolError> {
@@ -462,7 +503,7 @@ mod native {
         send(&inputs)
     }
 
-    fn send_keys(keys: &[Value], hold_ms: u64, started: &mut Option<Box<dyn FnOnce() + Send>>) -> Result<(), ProtocolError> {
+    fn send_keys(keys: &[Value], hold_ms: u64) -> Result<(), ProtocolError> {
         let names = keys.iter().filter_map(Value::as_str).collect::<Vec<_>>();
         if names.is_empty() {
             return Err(invalid("keypress requires at least one key"));
@@ -478,7 +519,7 @@ mod native {
         if primary_error.is_none() {
             if let Some(last) = vks.last() {
                 if let Err(error) = send(&[key(*last, false)]) { primary_error = Some(error); }
-                else { notify_started(started); if hold_ms > 0 { sleep(Duration::from_millis(hold_ms)); } }
+                else { if hold_ms > 0 { sleep(Duration::from_millis(hold_ms)); } }
             }
         }
         let mut release_error = None;
@@ -502,34 +543,28 @@ mod native {
     }
 
     fn vk_for(name: &str) -> Option<VIRTUAL_KEY> {
-        match name.to_ascii_lowercase().as_str() {
-            "enter" | "return" => Some(VK_RETURN),
-            "escape" | "esc" => Some(VK_ESCAPE),
-            "tab" => Some(VK_TAB),
-            "backspace" => Some(VK_BACK),
-            "delete" => Some(VK_DELETE),
-            "space" => Some(VK_SPACE),
-            "left" | "arrowleft" => Some(VK_LEFT),
-            "right" | "arrowright" => Some(VK_RIGHT),
-            "up" | "arrowup" => Some(VK_UP),
-            "down" | "arrowdown" => Some(VK_DOWN),
-            "home" => Some(VK_HOME),
-            "end" => Some(VK_END),
-            "pageup" => Some(VK_PRIOR),
-            "pagedown" => Some(VK_NEXT),
-            "ctrl" | "control" => Some(VK_CONTROL),
-            "shift" => Some(VK_SHIFT),
-            "alt" | "option" => Some(VK_MENU),
-            "cmd" | "win" | "meta" => Some(VK_LWIN),
-            key if key.len() == 1 => {
-                Some(VIRTUAL_KEY(key.as_bytes()[0].to_ascii_uppercase() as u16))
+        super::virtual_key(name).map(VIRTUAL_KEY)
+    }
+
+    pub fn inject_actuator(
+        actuator: crate::scheduler::Actuator,
+        down: bool,
+    ) -> Result<(), ProtocolError> {
+        use crate::scheduler::Actuator;
+        match actuator {
+            Actuator::Key(vk) => send(&[key(VIRTUAL_KEY(vk), !down)]),
+            Actuator::Button(button) => {
+                let (down_flag, up_flag) = mouse_button_flags(button.name())?;
+                send(&[mouse(if down { down_flag } else { up_flag }, 0)])
             }
-            key if key.starts_with('f') => key[1..]
-                .parse::<u16>()
-                .ok()
-                .filter(|n| (1..=24).contains(n))
-                .map(|n| VIRTUAL_KEY(VK_F1.0 + n - 1)),
-            _ => None,
+        }
+    }
+
+    pub fn inject_point(action: &crate::scheduler::PointAction) -> Result<(), ProtocolError> {
+        use crate::scheduler::PointAction;
+        match action {
+            PointAction::Move { x, y } => unsafe { SetCursorPos(*x, *y) }.map_err(input_failed),
+            PointAction::Scroll { x, y, dx, dy } => scroll(*x, *y, *dx, *dy),
         }
     }
 }
